@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using ModuleSaw;
 using Wasm.Model;
@@ -18,10 +19,24 @@ namespace WasmStrip {
         public ElementSection Elements;
         public CodeSection Code;
 
+        public Action<function_body, BinaryReader> FunctionBodyCallback = null;
+
         public readonly Dictionary<uint, string> FunctionNames = new Dictionary<uint, string>();
 
         public WasmReader (BinaryReader input) {
             Input = input;
+        }
+
+        public int ImportedFunctionCount {
+            get {
+                return Imports.entries.Count(e => e.kind == external_kind.Function);
+            }
+        }
+
+        public int ExportedFunctionCount {
+            get {
+                return Exports.entries.Count(e => e.kind == external_kind.Function);
+            }
         }
 
         public void Read () {
@@ -66,7 +81,7 @@ namespace WasmStrip {
                         break;
 
                     case SectionTypes.Code:
-                        Program.Assert(reader.ReadCodeSection(out Code));
+                        Program.Assert(reader.ReadCodeSection(out Code, FunctionBodyCallback));
                         break;
 
                     case SectionTypes.Data:

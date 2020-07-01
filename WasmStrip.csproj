@@ -25,6 +25,7 @@
 
   <ItemGroup>
     <Compile Include="external\ModuleSaw\LibModuleSaw\ArrayBinaryReader.cs" />
+    <Compile Include="external\ModuleSaw\LibModuleSaw\StreamWindow.cs" />
     <Compile Include="external\ModuleSaw\LibModuleSaw\Varint.cs" />
     <Compile Include="external\ModuleSaw\WasmSaw\Expression.cs" />
     <Compile Include="external\ModuleSaw\WasmSaw\ExpressionReader.cs" />

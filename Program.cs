@@ -26,6 +26,15 @@ namespace WasmStrip {
         public List<string> StripRegexes = new List<string>();
     }
 
+    class FunctionInfo {
+        public uint Index;
+        public uint TypeIndex;
+        public func_type Type;
+        public int EstimatedLinearStackSize;
+        public int LocalsSize;
+        public int NumLocals;
+    }
+
     class Program {
         public static int Main (string[] _args) {
             var execStarted = false;
@@ -85,9 +94,14 @@ namespace WasmStrip {
                 Console.WriteLine($"Processing module {config.ModulePath}...");
 
                 var wasmStream = new BinaryReader(File.OpenRead(config.ModulePath), System.Text.Encoding.UTF8, false);
+                var functions = new Dictionary<uint, FunctionInfo>();
                 WasmReader wasmReader;
                 using (wasmStream) {
                     wasmReader = new WasmReader(wasmStream);
+                    wasmReader.FunctionBodyCallback = (fb, br) => {
+                        var info = ProcessFunctionBody(wasmReader, fb, br, config);
+                        functions[info.Index] = info;
+                    };
                     wasmReader.Read();
                 }
             } finally {
@@ -101,6 +115,156 @@ namespace WasmStrip {
             }
 
             return 0;
+        }
+
+        public static FunctionInfo ProcessFunctionBody (WasmReader wr, function_body fb, BinaryReader br, Config config) {
+            var localsSize = 0;
+            var numLocals = 0;
+            uint typeIndex;
+
+            var result = new FunctionInfo {
+                Index = fb.Index,
+                TypeIndex = (typeIndex = wr.Functions.types[fb.Index]),
+                Type = wr.Types.entries[typeIndex]
+            };
+
+            foreach (var param in result.Type.param_types)
+                localsSize += GetSizeForLanguageType(param);
+            foreach (var local in fb.locals) {
+                localsSize += (int)(GetSizeForLanguageType(local.type) * local.count);
+                numLocals += (int)local.count;
+            }
+
+            result.LocalsSize = localsSize;
+            result.NumLocals = numLocals;
+            result.EstimatedLinearStackSize = GetLinearStackSizeForFunction(fb, result.Type, br);
+
+            return result;
+        }
+
+        private static int GetSizeForLanguageType (LanguageTypes type) {
+            switch (type) {
+                case LanguageTypes.f32:
+                    return 4;
+                case LanguageTypes.f64:
+                    return 8;
+                case LanguageTypes.i32:
+                    return 4;
+                case LanguageTypes.i64:
+                    return 8;
+                case LanguageTypes.anyfunc:
+                case LanguageTypes.func:
+                    return 4;
+                default:
+                    return 0;
+            }
+        }
+
+        private static Expression MakeI32Const (int i) {
+            return new Expression {
+                Opcode = Opcodes.i32_const,
+                Body = { U = { i32 = i }, Type = ExpressionBody.Types.i32 }
+            };
+        }
+
+        private static int GetLinearStackSizeForFunction (function_body fb, func_type type, BinaryReader br) {
+            try {
+                using (var subStream = new ModuleSaw.StreamWindow(fb.Stream, fb.StreamOffset, fb.StreamEnd - fb.StreamOffset)) {
+                    var reader = new ExpressionReader(new BinaryReader(subStream));
+
+                    Expression expr;
+                    Opcodes previous = Opcodes.end;
+
+                    var localCount = fb.locals.Sum(l => l.count) + type.param_types.Length;
+                    var locals = new Expression[localCount];
+                    Expression global0 = MakeI32Const(0);
+                    var stack = new Stack<Expression>();
+
+                    int num_read = 0;
+                    while (reader.TryReadExpression(out expr) && num_read < 20) {
+                        if (!reader.TryReadExpressionBody(ref expr))
+                            throw new Exception("Failed to read body of " + expr.Opcode);
+
+                        num_read++;
+
+                        ProcessExpressionForStackSizeCalculation(fb, expr, locals, ref global0, stack, ref num_read);
+
+                        previous = expr.Opcode;
+                    }
+
+                    return Math.Abs(global0.Body.U.i32);
+                }
+            } catch (Exception exc) {
+                Console.Error.WriteLine ($"Error determining linear stack size: {exc}");
+                return 0;
+            }
+        }
+
+        private static void ProcessExpressionForStackSizeCalculation (function_body fb, Expression expr, Expression[] locals, ref Expression global0, Stack<Expression> stack, ref int num_read) {
+            if (fb.Index == 1749)
+                ;
+
+            switch (expr.Opcode) {
+                case Opcodes.i32_const:
+                case Opcodes.i64_const:
+                case Opcodes.f32_const:
+                case Opcodes.f64_const:
+                    stack.Push(expr);
+                    break;
+                case Opcodes.get_global:
+                    // HACK
+                    stack.Push(MakeI32Const(0));
+                    break;
+                case Opcodes.set_global:
+                    if (expr.Body.U.u32 == 0) {
+                        global0 = stack.Pop();
+                        num_read = 9999;
+                    } else
+                        stack.Pop();
+                    break;
+                case Opcodes.get_local:
+                    stack.Push(locals[expr.Body.U.u32]);
+                    break;
+                case Opcodes.set_local:
+                    locals[expr.Body.U.u32] = stack.Pop();
+                    break;
+                case Opcodes.tee_local:
+                    locals[expr.Body.U.u32] = stack.Peek();
+                    break;
+                case Opcodes.i32_load:
+                    stack.Pop();
+                    // FIXME
+                    stack.Push(MakeI32Const(int.MinValue));
+                    break;
+                case Opcodes.i32_store:
+                    stack.Pop();
+                    break;
+                case Opcodes.i32_add:
+                case Opcodes.i32_sub: {
+                        var a = stack.Pop().Body.U.i32;
+                        var b = stack.Pop().Body.U.i32;
+                        stack.Push(MakeI32Const(
+                            a + (b * (expr.Opcode == Opcodes.i32_sub ? -1 : 1))
+                        ));
+                        break;
+                    }
+                case Opcodes.block:
+                    foreach (var child in expr.Body.children) {
+                        ProcessExpressionForStackSizeCalculation(fb, child, locals, ref global0, stack, ref num_read);
+                        if (num_read >= 9999)
+                            break;
+                    }
+
+                    break;
+                case Opcodes.end:
+                    break;
+                // Not implemented
+                case Opcodes.call:
+                case Opcodes.call_indirect:
+                default:
+                    num_read = 9999;
+                    break;
+            }
         }
 
         public static void ParseOption (string arg, Config config) {
