@@ -7,83 +7,160 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.RegularExpressions;
-using Gee.External.Capstone.X86;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Wasm.Model;
 
 namespace WasmStrip {
     class Config {
-        public string Mode, ModulePath;
+        public string ModulePath;
+
+        public string ReportPath;
+        public string DiffAgainst;
+        public string DiffPath;
+
+        public string StripOutputPath;
+        public string StripRetainListPath;
+        public string StripListPath;
+        public List<string> StripRetainRegexes = new List<string>();
+        public List<string> StripRegexes = new List<string>();
     }
 
     class Program {
         public static int Main (string[] _args) {
-            var args = new List<string> (_args);
-            if (args.Length != 1) {
-                Console.Error.WriteLine("Usage: WasmStrip module.wasm --mode=mode [--option ...] [@response.rsp]");
-                return 1;
-            }
+            var execStarted = false;
 
-            var config = new Config();
-            var argErrorCount = 0;
+            try {
+                var args = new List<string> (_args);
 
-            for (int i = 0; i < args.Count; i++) {
-                var arg = args[i];
-                if (arg[0] == '@') {
-                    try {
-                        ParseResponseFile(arg[0].Substring(1), args);
-                    } catch (Exception exc) {
-                        Console.Error.WriteLine($"Error parsing response file '{arg}': {exc}");
-                        argErrorCount++;
-                    }
-                    args.RemoveAt(i--);
-                } else if (arg.StartsWith("--")) {
-                    ParseOption(arg, config);
-                    args.RemoveAt(i--);
-                } else {
-                    try {
-                        if (!File.Exists(arg))
-                            throw new FileNotFoundException(arg);
-                    } catch (Exception exc) {
-                        Console.Error.WriteLine($"Argument error for '{arg}': {exc}");
-                        argErrorCount++;
+                var config = new Config();
+                var argErrorCount = 0;
+
+                for (int i = 0; i < args.Count; i++) {
+                    var arg = args[i];
+                    if (arg[0] == '@') {
+                        try {
+                            ParseResponseFile(arg.Substring(1), args);
+                        } catch (Exception exc) {
+                            Console.Error.WriteLine($"Error parsing response file '{arg}': {exc}");
+                            argErrorCount++;
+                        }
+                        args.RemoveAt(i--);
+                    } else if (arg.StartsWith("--")) {
+                        if (arg == "--")
+                            break;
+
+                        ParseOption(arg.Substring(2), config);
+                        args.RemoveAt(i--);
+                    } else {
+                        if (arg.StartsWith('"') && arg.EndsWith('"')) {
+                            arg = arg.Substring(1, arg.Length - 2);
+                            args[i] = arg;
+                        }
+
+                        try {
+                            if (!File.Exists(arg))
+                                throw new FileNotFoundException(arg);
+                        } catch (Exception exc) {
+                            Console.Error.WriteLine($"Argument error for '{arg}': {exc}");
+                            argErrorCount++;
+                        }
                     }
                 }
-            }
 
-            if (argErrorCount > 0)
-                return 2;
+                if (argErrorCount > 0)
+                    return 2;
 
-            config.ModulePath = args[0];
-            if (!File.Exists(config.ModulePath)) {
-                Console.Error.WriteLine($"File not found: {config.ModulePath}");
-                return 3;
-            }
+                if (args.Count != 1)
+                    return 1;
 
-            if (config.Mode == null) {
-                Console.Error.WriteLine("No mode specified");
-                return 4;
-            }
+                config.ModulePath = args[0];
+                if (string.IsNullOrWhiteSpace(config.ModulePath) || !File.Exists(config.ModulePath)) {
+                    Console.Error.WriteLine($"File not found: '{config.ModulePath}'");
+                    return 3;
+                }
 
-            Console.WriteLine($"Processing module {config.ModulePath}...");
+                execStarted = true;
 
-            var wasmStream = new BinaryReader(File.OpenRead(config.ModulePath), System.Text.Encoding.UTF8, false);
-            WasmReader wasmReader;
-            using (wasmStream) {
-                wasmReader = new WasmReader(wasmStream);
-                wasmReader.Read();
-            }
+                Console.WriteLine($"Processing module {config.ModulePath}...");
 
-            if (Debugger.IsAttached) {
-                Console.WriteLine("Press enter to exit");
-                Console.ReadLine();
+                var wasmStream = new BinaryReader(File.OpenRead(config.ModulePath), System.Text.Encoding.UTF8, false);
+                WasmReader wasmReader;
+                using (wasmStream) {
+                    wasmReader = new WasmReader(wasmStream);
+                    wasmReader.Read();
+                }
+            } finally {
+                if (!execStarted)
+                    Console.Error.WriteLine("Usage: WasmStrip module.wasm --mode=mode [--option ...] [@response.rsp]");
+
+                if (Debugger.IsAttached) {
+                    Console.WriteLine("Press enter to exit");
+                    Console.ReadLine();
+                }
             }
 
             return 0;
         }
 
+        public static void ParseOption (string arg, Config config) {
+            string operand = null;
+
+            var equalsOffset = arg.IndexOfAny(new[] { ':', '=' });
+            if (equalsOffset >= 0) {
+                operand = arg.Substring(equalsOffset + 1);
+                arg = arg.Substring(0, equalsOffset);
+            }
+
+            if (operand.StartsWith('"') && operand.EndsWith('"'))
+                operand = operand.Substring(1, operand.Length - 2);
+
+            switch (arg.ToLower()) {
+                case "report":
+                case "reportout":
+                case "reportoutput":
+                case "reportpath":
+                    config.ReportPath = operand;
+                    break;
+                case "diff":
+                    config.DiffAgainst = operand;
+                    break;
+                case "diffout":
+                case "diffoutput":
+                case "diffpath":
+                    config.DiffPath = operand;
+                    break;
+                case "output":
+                case "outpath":
+                case "out":
+                    config.StripOutputPath = operand;
+                    break;
+                case "retain":
+                    config.StripRetainRegexes.Add(operand);
+                    break;
+                case "strip":
+                    config.StripRegexes.Add(operand);
+                    break;
+                case "striplist":
+                    TrySet(ref config.StripListPath, operand);
+                    break;
+                case "retainlist":
+                    TrySet(ref config.StripRetainListPath, operand);
+                    break;
+            }
+        }
+
+        public static void TrySet (ref string result, string value) {
+            if (!string.IsNullOrWhiteSpace(result))
+                throw new Exception ($"Argument was already set to '{result}' when trying to set it to '{value}'");
+
+            result = value;
+        }
+
         public static void ParseResponseFile (string path, List<string> args) {
+            if (path.StartsWith('"') && path.EndsWith('"'))
+                path = path.Substring(1, path.Length - 2);
+
             foreach (var line in File.ReadAllLines(path))
                 args.Add(line);
         }

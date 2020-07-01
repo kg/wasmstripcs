@@ -32,6 +32,9 @@ namespace WasmStrip {
             SectionHeader sh;
 
             while (reader.ReadSectionHeader(out sh)) {
+                if (sh.StreamPayloadEnd > reader.Reader.BaseStream.Length)
+                    throw new Exception("Invalid header");
+
                 switch (sh.id) {
                     case SectionTypes.Type:
                         Program.Assert(reader.ReadTypeSection(out Types));
@@ -86,7 +89,8 @@ namespace WasmStrip {
         }
 
         private void ReadNameSection (ModuleReader reader, BinaryReader sr, SectionHeader nameSectionHeader) {
-            while (sr.BaseStream.Position < nameSectionHeader.StreamPayloadEnd) {
+            var bs = sr.BaseStream;
+            while ((bs.Position < nameSectionHeader.StreamPayloadEnd) && (bs.Position < bs.Length)) {
                 var id = reader.Reader.ReadByte();
                 var size = (uint)reader.Reader.ReadLEBUInt();
                 switch (id) {
