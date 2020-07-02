@@ -26,6 +26,12 @@ namespace WasmStrip {
         public List<string> StripRegexes = new List<string>();
     }
 
+    class NamespaceInfo {
+        public string Name;
+        public uint FunctionCount;
+        public uint SizeBytes;
+    }
+
     class FunctionInfo {
         public uint Index;
         public uint TypeIndex;
@@ -162,6 +168,38 @@ namespace WasmStrip {
                 <Cell><Data ss:Type=""String"">Signature</Data><NamedCell ss:Name=""_FilterDatabase""/></Cell>
             </Row>");
 
+                var namespaces = new Dictionary<string, NamespaceInfo>();
+                foreach (var fn in functions.Values) {
+                    if (string.IsNullOrWhiteSpace(fn.Name))
+                        continue;
+
+                    var namespaceName = fn.Name;
+
+                    while ((namespaceName = GetNamespaceName(namespaceName)) != null) {
+                        NamespaceInfo ns;
+                        if (!namespaces.TryGetValue(namespaceName, out ns))
+                            namespaces[namespaceName] = ns = new NamespaceInfo { Name = namespaceName };
+
+                        ns.FunctionCount += 1;
+                        ns.SizeBytes += fn.Body.body_size;
+                    }
+                }
+
+                var i = 0;
+                foreach (var ns in namespaces.Values) {
+                    if (ns.FunctionCount < 2)
+                        continue;
+
+                    output.WriteLine("            <Row>");
+                    WriteCell(output, "String", "namespace");
+                    WriteCell(output, "Number", i.ToString());
+                    WriteCell(output, "String", ns.Name);
+                    WriteCell(output, "Number", ns.SizeBytes.ToString());
+                    WriteCell(output, "String", $"{ns.FunctionCount:00000} function(s)");
+                    output.WriteLine("            </Row>");
+                    i++;
+                }
+
                 foreach (var fn in functions.Values) {
                     output.WriteLine("            <Row>");
                     WriteCell(output, "String", "function");
@@ -191,6 +229,38 @@ namespace WasmStrip {
         <AutoFilter x:Range=""R1C1:R1C5"" xmlns=""urn:schemas-microsoft-com:office:excel""></AutoFilter>
     </Worksheet>
 </Workbook>");
+
+            }
+        }
+
+        private static string GetNamespaceName (string name) {
+            if (string.IsNullOrWhiteSpace(name))
+                return null;
+
+            var firstParen = name.IndexOf("(");
+
+            // C++ names will have 'type ns::fn' format so strip the leading type if present
+            if (name.Contains("::") && firstParen > 0) {
+                var firstSpace = name.IndexOfAny(new[] { ' ', '<', '(' });
+                if ((firstSpace > 0) && (name[firstSpace] == ' ')) {
+                    name = name.Substring(firstSpace + 1);
+                    firstParen = name.IndexOf("(");
+                }
+            }
+
+            // If there's an opening parentheses (function name) stop searching there
+            if (firstParen < 0)
+                firstParen = name.Length;
+
+            var lastNsBreak = name.LastIndexOf("::", Math.Min(firstParen, Math.Max(0, name.Length - 4)), StringComparison.Ordinal);
+            if (lastNsBreak <= 0) {
+                var lastUnderscore = name.LastIndexOf("_", Math.Min(firstParen, Math.Max(0, name.Length - 3)), StringComparison.Ordinal);
+                if (lastUnderscore > 0)
+                    return name.Substring(0, lastUnderscore + 1) + "*";
+                else
+                    return null;
+            } else {
+                return name.Substring(0, lastNsBreak + 2) + "*";
             }
         }
 
