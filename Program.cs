@@ -30,7 +30,6 @@ namespace WasmStrip {
         public uint Index;
         public uint TypeIndex;
         public func_type Type;
-        public int EstimatedLinearStackSize;
         public int LocalsSize;
         public int NumLocals;
     }
@@ -93,7 +92,8 @@ namespace WasmStrip {
 
                 Console.WriteLine($"Processing module {config.ModulePath}...");
 
-                var wasmStream = new BinaryReader(File.OpenRead(config.ModulePath), System.Text.Encoding.UTF8, false);
+                var wasmBytes = File.ReadAllBytes(config.ModulePath);
+                var wasmStream = new BinaryReader(new MemoryStream(wasmBytes), System.Text.Encoding.UTF8, false);
                 var functions = new Dictionary<uint, FunctionInfo>();
                 WasmReader wasmReader;
                 using (wasmStream) {
@@ -103,10 +103,21 @@ namespace WasmStrip {
                         functions[info.Index] = info;
                     };
                     wasmReader.Read();
+
+                    if (config.ReportPath != null)
+                        GenerateReport(config, wasmStream, wasmReader, functions);
                 }
             } finally {
-                if (!execStarted)
-                    Console.Error.WriteLine("Usage: WasmStrip module.wasm --mode=mode [--option ...] [@response.rsp]");
+                if (!execStarted) {
+                    Console.Error.WriteLine("Usage: WasmStrip module.wasm [--option ...] [@response.rsp]");
+                    Console.Error.WriteLine("  --reportout=filename.csv");
+                    Console.Error.WriteLine("  --diffagainst=oldmodule.wasm --diffout=filename.csv");
+                    Console.Error.WriteLine("  --out=newmodule.wasm ...");
+                    Console.Error.WriteLine("    --strip=regex [...]");
+                    Console.Error.WriteLine("    --striplist=regexes.txt");
+                    Console.Error.WriteLine("    --retain=regex [...]");
+                    Console.Error.WriteLine("    --retainlist=regexes.txt");
+                }
 
                 if (Debugger.IsAttached) {
                     Console.WriteLine("Press enter to exit");
@@ -115,6 +126,11 @@ namespace WasmStrip {
             }
 
             return 0;
+        }
+
+        private static void GenerateReport (Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
+            using (var output = new StreamWriter(config.ReportPath, false, Encoding.UTF8)) {
+            }
         }
 
         public static FunctionInfo ProcessFunctionBody (WasmReader wr, function_body fb, BinaryReader br, Config config) {
@@ -137,7 +153,6 @@ namespace WasmStrip {
 
             result.LocalsSize = localsSize;
             result.NumLocals = numLocals;
-            result.EstimatedLinearStackSize = GetLinearStackSizeForFunction(fb, result.Type, br);
 
             return result;
         }
@@ -167,106 +182,6 @@ namespace WasmStrip {
             };
         }
 
-        private static int GetLinearStackSizeForFunction (function_body fb, func_type type, BinaryReader br) {
-            try {
-                using (var subStream = new ModuleSaw.StreamWindow(fb.Stream, fb.StreamOffset, fb.StreamEnd - fb.StreamOffset)) {
-                    var reader = new ExpressionReader(new BinaryReader(subStream));
-
-                    Expression expr;
-                    Opcodes previous = Opcodes.end;
-
-                    var localCount = fb.locals.Sum(l => l.count) + type.param_types.Length;
-                    var locals = new Expression[localCount];
-                    Expression global0 = MakeI32Const(0);
-                    var stack = new Stack<Expression>();
-
-                    int num_read = 0;
-                    while (reader.TryReadExpression(out expr) && num_read < 20) {
-                        if (!reader.TryReadExpressionBody(ref expr))
-                            throw new Exception("Failed to read body of " + expr.Opcode);
-
-                        num_read++;
-
-                        ProcessExpressionForStackSizeCalculation(fb, expr, locals, ref global0, stack, ref num_read);
-
-                        previous = expr.Opcode;
-                    }
-
-                    return Math.Abs(global0.Body.U.i32);
-                }
-            } catch (Exception exc) {
-                Console.Error.WriteLine ($"Error determining linear stack size: {exc}");
-                return 0;
-            }
-        }
-
-        private static void ProcessExpressionForStackSizeCalculation (function_body fb, Expression expr, Expression[] locals, ref Expression global0, Stack<Expression> stack, ref int num_read) {
-            if (fb.Index == 1749)
-                ;
-
-            switch (expr.Opcode) {
-                case Opcodes.i32_const:
-                case Opcodes.i64_const:
-                case Opcodes.f32_const:
-                case Opcodes.f64_const:
-                    stack.Push(expr);
-                    break;
-                case Opcodes.get_global:
-                    // HACK
-                    stack.Push(MakeI32Const(0));
-                    break;
-                case Opcodes.set_global:
-                    if (expr.Body.U.u32 == 0) {
-                        global0 = stack.Pop();
-                        num_read = 9999;
-                    } else
-                        stack.Pop();
-                    break;
-                case Opcodes.get_local:
-                    stack.Push(locals[expr.Body.U.u32]);
-                    break;
-                case Opcodes.set_local:
-                    locals[expr.Body.U.u32] = stack.Pop();
-                    break;
-                case Opcodes.tee_local:
-                    locals[expr.Body.U.u32] = stack.Peek();
-                    break;
-                case Opcodes.i32_load:
-                    stack.Pop();
-                    // FIXME
-                    stack.Push(MakeI32Const(int.MinValue));
-                    break;
-                case Opcodes.i32_store:
-                    stack.Pop();
-                    break;
-                case Opcodes.i32_add:
-                case Opcodes.i32_sub: {
-                        var a = stack.Pop().Body.U.i32;
-                        var b = stack.Pop().Body.U.i32;
-                        stack.Push(MakeI32Const(
-                            a + (b * (expr.Opcode == Opcodes.i32_sub ? -1 : 1))
-                        ));
-                        break;
-                    }
-                case Opcodes.block:
-                    foreach (var child in expr.Body.children) {
-                        ProcessExpressionForStackSizeCalculation(fb, child, locals, ref global0, stack, ref num_read);
-                        if (num_read >= 9999)
-                            break;
-                    }
-
-                    break;
-                case Opcodes.end:
-                    break;
-                // Not implemented
-                case Opcodes.call:
-                case Opcodes.call_indirect:
-                default:
-                    num_read = 9999;
-                    break;
-            }
-        }
-
         public static void ParseOption (string arg, Config config) {
             string operand = null;
 
@@ -287,6 +202,7 @@ namespace WasmStrip {
                     config.ReportPath = operand;
                     break;
                 case "diff":
+                case "diffagainst":
                     config.DiffAgainst = operand;
                     break;
                 case "diffout":
@@ -300,9 +216,11 @@ namespace WasmStrip {
                     config.StripOutputPath = operand;
                     break;
                 case "retain":
+                case "retainRegex":
                     config.StripRetainRegexes.Add(operand);
                     break;
                 case "strip":
+                case "stripRegex":
                     config.StripRegexes.Add(operand);
                     break;
                 case "striplist":
