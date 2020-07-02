@@ -30,6 +30,9 @@ namespace WasmStrip {
         public uint Index;
         public uint TypeIndex;
         public func_type Type;
+        public function_body Body;
+        public string Name;
+        public List<string> ExportNames;
         public int LocalsSize;
         public int NumLocals;
     }
@@ -104,13 +107,21 @@ namespace WasmStrip {
                     };
                     wasmReader.Read();
 
+                    foreach (var kvp in wasmReader.FunctionNames) {
+                        var biasedIndex = (kvp.Key - wasmReader.ImportedFunctionCount);
+                        if (biasedIndex < 0)
+                            continue;
+
+                        functions[(uint)biasedIndex].Name = kvp.Value;
+                    }
+
                     if (config.ReportPath != null)
                         GenerateReport(config, wasmStream, wasmReader, functions);
                 }
             } finally {
                 if (!execStarted) {
                     Console.Error.WriteLine("Usage: WasmStrip module.wasm [--option ...] [@response.rsp]");
-                    Console.Error.WriteLine("  --reportout=filename.csv");
+                    Console.Error.WriteLine("  --reportout=filename.xml");
                     Console.Error.WriteLine("  --diffagainst=oldmodule.wasm --diffout=filename.csv");
                     Console.Error.WriteLine("  --out=newmodule.wasm ...");
                     Console.Error.WriteLine("    --strip=regex [...]");
@@ -130,6 +141,100 @@ namespace WasmStrip {
 
         private static void GenerateReport (Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
             using (var output = new StreamWriter(config.ReportPath, false, Encoding.UTF8)) {
+                output.WriteLine(@"<?xml version=""1.0"" encoding=""UTF-8""?>
+<?mso-application progid=""Excel.Sheet""?>
+<Workbook xmlns=""urn:schemas-microsoft-com:office:spreadsheet"" xmlns:x=""urn:schemas-microsoft-com:office:excel"" xmlns:ss=""urn:schemas-microsoft-com:office:spreadsheet"" xmlns:html=""https://www.w3.org/TR/html401/"">
+    <Worksheet ss:Name=""Report"">
+        <Names>
+            <NamedRange ss:Name=""_FilterDatabase"" ss:RefersTo=""=Report!R1C1:R1C5"" ss:Hidden=""1""/>
+        </Names>
+        <Table>
+            <Column ss:Index=""1"" ss:Width=""70"" />
+            <Column ss:Index=""2"" ss:Width=""60"" />
+            <Column ss:Index=""3"" ss:Width=""350"" />
+            <Column ss:Index=""4"" ss:Width=""70"" />
+            <Column ss:Index=""5"" ss:Width=""100"" />
+            <Row>
+                <Cell><Data ss:Type=""String"">Type</Data><NamedCell ss:Name=""_FilterDatabase""/></Cell>
+                <Cell><Data ss:Type=""String"">Index</Data><NamedCell ss:Name=""_FilterDatabase""/></Cell>
+                <Cell><Data ss:Type=""String"">Name</Data><NamedCell ss:Name=""_FilterDatabase""/></Cell>
+                <Cell><Data ss:Type=""String"">Size (Bytes)</Data><NamedCell ss:Name=""_FilterDatabase""/></Cell>
+                <Cell><Data ss:Type=""String"">Signature</Data><NamedCell ss:Name=""_FilterDatabase""/></Cell>
+            </Row>");
+
+                foreach (var fn in functions.Values) {
+                    output.WriteLine("            <Row>");
+                    WriteCell(output, "String", "function");
+                    WriteCell(output, "Number", fn.Index.ToString());
+                    WriteCell(output, "String", fn.Name ?? "");
+                    WriteCell(output, "Number", fn.Body.body_size.ToString());
+                    WriteCell(output, "String", GetSignatureForType(fn.Type));
+                    output.WriteLine("            </Row>");
+                }
+
+                output.WriteLine(@"        </Table>
+        <WorksheetOptions xmlns=""urn:schemas-microsoft-com:office:excel"">
+            <FreezePanes/>
+            <FrozenNoSplit/>
+            <SplitHorizontal>1</SplitHorizontal>
+            <TopRowBottomPane>1</TopRowBottomPane>
+            <ActivePane>2</ActivePane>
+            <Panes>
+                <Pane>
+                    <Number>3</Number>
+                </Pane>
+                <Pane>
+                    <Number>2</Number>
+                </Pane>
+            </Panes>
+        </WorksheetOptions>
+        <AutoFilter x:Range=""R1C1:R1C5"" xmlns=""urn:schemas-microsoft-com:office:excel""></AutoFilter>
+    </Worksheet>
+</Workbook>");
+            }
+        }
+
+        private static void WriteCell (StreamWriter sw, string type, string value) {
+            var escaped = System.Security.SecurityElement.Escape(value);
+            sw.WriteLine($"                <Cell><Data ss:Type=\"{type}\">{escaped}</Data></Cell>");
+        }
+
+        private static string GetSignatureForType (func_type type) {
+            var sb = new StringBuilder();
+
+            Append(sb, type.return_type);
+            sb.Append("(");
+            foreach (var pt in type.param_types)
+                Append(sb, pt);
+            sb.Append(")");
+
+            return sb.ToString();
+        }
+
+        private static void Append (StringBuilder sb, LanguageTypes type) {
+            switch (type) {
+                case LanguageTypes.none:
+                    return;
+                case LanguageTypes.i32:
+                    sb.Append("i");
+                    return;
+                case LanguageTypes.i64:
+                    sb.Append("l");
+                    return;
+                case LanguageTypes.f32:
+                    sb.Append("s");
+                    return;
+                case LanguageTypes.f64:
+                    sb.Append("d");
+                    return;
+                case LanguageTypes.anyfunc:
+                case LanguageTypes.func:
+                    sb.Append("f");
+                    return;
+                default:
+                    // FIXME
+                    sb.Append("?");
+                    return;
             }
         }
 
@@ -141,7 +246,8 @@ namespace WasmStrip {
             var result = new FunctionInfo {
                 Index = fb.Index,
                 TypeIndex = (typeIndex = wr.Functions.types[fb.Index]),
-                Type = wr.Types.entries[typeIndex]
+                Type = wr.Types.entries[typeIndex],
+                Body = fb
             };
 
             foreach (var param in result.Type.param_types)
