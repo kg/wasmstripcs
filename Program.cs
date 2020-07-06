@@ -168,6 +168,18 @@ namespace WasmStrip {
                 <Cell><Data ss:Type=""String"">Signature</Data><NamedCell ss:Name=""_FilterDatabase""/></Cell>
             </Row>");
 
+                var i = 0;
+                foreach (var sh in wasmReader.SectionHeaders) {
+                    output.WriteLine("            <Row>");
+                    WriteCell(output, "String", "section");
+                    WriteCell(output, "Number", i.ToString());
+                    WriteCell(output, "String", sh.name ?? "");
+                    WriteCell(output, "Number", sh.payload_len.ToString());
+                    WriteCell(output, "String", sh.id.ToString());
+                    output.WriteLine("            </Row>");
+                    i++;
+                }
+
                 var namespaces = new Dictionary<string, NamespaceInfo>();
                 foreach (var fn in functions.Values) {
                     if (string.IsNullOrWhiteSpace(fn.Name))
@@ -185,7 +197,7 @@ namespace WasmStrip {
                     }
                 }
 
-                var i = 0;
+                i = 0;
                 foreach (var ns in namespaces.Values) {
                     if (ns.FunctionCount < 2)
                         continue;

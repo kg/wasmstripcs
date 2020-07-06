@@ -21,6 +21,7 @@ namespace WasmStrip {
 
         public Action<function_body, BinaryReader> FunctionBodyCallback = null;
 
+        public readonly List<SectionHeader> SectionHeaders = new List<SectionHeader>();
         public readonly Dictionary<uint, string> FunctionNames = new Dictionary<uint, string>();
 
         public WasmReader (BinaryReader input) {
@@ -49,6 +50,8 @@ namespace WasmStrip {
             while (reader.ReadSectionHeader(out sh)) {
                 if (sh.StreamPayloadEnd > reader.Reader.BaseStream.Length)
                     throw new Exception("Invalid header");
+
+                SectionHeaders.Add(sh);
 
                 switch (sh.id) {
                     case SectionTypes.Type:
