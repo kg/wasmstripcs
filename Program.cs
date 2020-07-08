@@ -24,6 +24,9 @@ namespace WasmStrip {
         public string StripListPath;
         public List<string> StripRetainRegexes = new List<string>();
         public List<string> StripRegexes = new List<string>();
+
+        public string DumpSectionsPath;
+        public List<string> DumpSectionRegexes = new List<string>();
     }
 
     class NamespaceInfo {
@@ -123,17 +126,24 @@ namespace WasmStrip {
 
                     if (config.ReportPath != null)
                         GenerateReport(config, wasmStream, wasmReader, functions);
+
+                    if (config.DumpSectionsPath != null)
+                        DumpSections(config, wasmStream, wasmReader);
                 }
             } finally {
                 if (!execStarted) {
                     Console.Error.WriteLine("Usage: WasmStrip module.wasm [--option ...] [@response.rsp]");
-                    Console.Error.WriteLine("  --reportout=filename.xml");
-                    Console.Error.WriteLine("  --diffagainst=oldmodule.wasm --diffout=filename.csv");
-                    Console.Error.WriteLine("  --out=newmodule.wasm ...");
+                    Console.Error.WriteLine("  --report-out=filename.xml");
+                    Console.Error.WriteLine("  --diff-against=oldmodule.wasm --diff-out=filename.csv");
+                    Console.Error.WriteLine("  --dump-sections[=regex] --dump-sections-to=outdir/");
+                    /*
+                    Console.Error.WriteLine("  --out=newmodule.wasm");
+                    Console.Error.WriteLine("    --strip-section=regex [...]");
                     Console.Error.WriteLine("    --strip=regex [...]");
-                    Console.Error.WriteLine("    --striplist=regexes.txt");
+                    Console.Error.WriteLine("    --strip-list=regexes.txt");
                     Console.Error.WriteLine("    --retain=regex [...]");
-                    Console.Error.WriteLine("    --retainlist=regexes.txt");
+                    Console.Error.WriteLine("    --retain-list=regexes.txt");
+                    */
                 }
 
                 if (Debugger.IsAttached) {
@@ -145,37 +155,54 @@ namespace WasmStrip {
             return 0;
         }
 
+        private static void DumpSections (Config config, BinaryReader wasmStream, WasmReader wasmReader) {
+            Directory.CreateDirectory(config.DumpSectionsPath);
+
+            for (int i = 0; i < wasmReader.SectionHeaders.Count; i++) {
+                var sh = wasmReader.SectionHeaders[i];
+                var id = $"{i:00} {sh.id.ToString()} {sh.name ?? ""}".Trim();
+                var path = Path.Combine(config.DumpSectionsPath, id);
+
+                if (config.DumpSectionRegexes.Count > 0) {
+                    if (!config.DumpSectionRegexes.Any(re => Regex.IsMatch(id, re)))
+                        continue;
+                }
+
+                using (var outStream = File.OpenWrite(path)) {
+                    outStream.SetLength(0);
+                    var sw = new ModuleSaw.StreamWindow(wasmStream.BaseStream, sh.StreamPayloadStart, sh.StreamPayloadEnd - sh.StreamPayloadStart);
+                    sw.CopyTo(outStream);
+                }
+            }
+        }
+
         private static void GenerateReport (Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
+            var lastFolder = Path.GetFileName(Path.GetDirectoryName(config.ModulePath));
+            var sheetName = Path.Combine(lastFolder, Path.GetFileName(config.ModulePath)).Replace('\\', '|').Replace('/', '|');
+
             using (var output = new StreamWriter(config.ReportPath, false, Encoding.UTF8)) {
                 output.WriteLine(@"<?xml version=""1.0"" encoding=""UTF-8""?>
 <?mso-application progid=""Excel.Sheet""?>
-<Workbook xmlns=""urn:schemas-microsoft-com:office:spreadsheet"" xmlns:x=""urn:schemas-microsoft-com:office:excel"" xmlns:ss=""urn:schemas-microsoft-com:office:spreadsheet"" xmlns:html=""https://www.w3.org/TR/html401/"">
-    <Worksheet ss:Name=""Report"">
-        <Names>
-            <NamedRange ss:Name=""_FilterDatabase"" ss:RefersTo=""=Report!R1C1:R1C5"" ss:Hidden=""1""/>
-        </Names>
-        <Table>
-            <Column ss:Index=""1"" ss:Width=""70"" />
-            <Column ss:Index=""2"" ss:Width=""60"" />
-            <Column ss:Index=""3"" ss:Width=""350"" />
-            <Column ss:Index=""4"" ss:Width=""70"" />
-            <Column ss:Index=""5"" ss:Width=""100"" />
-            <Row>
-                <Cell><Data ss:Type=""String"">Type</Data><NamedCell ss:Name=""_FilterDatabase""/></Cell>
-                <Cell><Data ss:Type=""String"">Index</Data><NamedCell ss:Name=""_FilterDatabase""/></Cell>
-                <Cell><Data ss:Type=""String"">Name</Data><NamedCell ss:Name=""_FilterDatabase""/></Cell>
-                <Cell><Data ss:Type=""String"">Size (Bytes)</Data><NamedCell ss:Name=""_FilterDatabase""/></Cell>
-                <Cell><Data ss:Type=""String"">Signature</Data><NamedCell ss:Name=""_FilterDatabase""/></Cell>
-            </Row>");
+<Workbook xmlns=""urn:schemas-microsoft-com:office:spreadsheet"" xmlns:x=""urn:schemas-microsoft-com:office:excel"" xmlns:ss=""urn:schemas-microsoft-com:office:spreadsheet"" xmlns:html=""https://www.w3.org/TR/html401/"">"
+                );
+
+                output.WriteLine($"<Worksheet ss:Name=\"{sheetName}\">");
+                output.WriteLine($"<Names><NamedRange ss:Name=\"_FilterDatabase\" ss:RefersTo=\"='{sheetName}'!R1C1:R1C5\" ss:Hidden=\"1\"/></Names>");
+                output.WriteLine($"<Table>");
+
+                WriteColumns(
+                    output,
+                    new[] { 70, 60, 350, 70, 100 },
+                    new[] { "Type", "Index", "Name", "Size (Bytes)", "Signature" }
+                );
 
                 var i = 0;
                 foreach (var sh in wasmReader.SectionHeaders) {
                     output.WriteLine("            <Row>");
                     WriteCell(output, "String", "section");
                     WriteCell(output, "Number", i.ToString());
-                    WriteCell(output, "String", sh.name ?? "");
+                    WriteCell(output, "String", $"{sh.id.ToString()}{(string.IsNullOrWhiteSpace(sh.name) ? "" : " '" + sh.name + "'")}");
                     WriteCell(output, "Number", sh.payload_len.ToString());
-                    WriteCell(output, "String", sh.id.ToString());
                     output.WriteLine("            </Row>");
                     i++;
                 }
@@ -245,6 +272,22 @@ namespace WasmStrip {
             }
         }
 
+        private static void WriteColumns (StreamWriter output, int[] widths, string[] labels) {
+            for (var i = 0; i < widths.Length; i++)
+                output.WriteLine($"<Column ss:Index=\"{i + 1}\" ss:Width=\"{widths[i]}\" />");
+
+            output.WriteLine("<Row>");
+            for (var i = 0; i < labels.Length; i++)
+                output.WriteLine($"<Cell><Data ss:Type=\"String\">{labels[i]}</Data><NamedCell ss:Name=\"_FilterDatabase\"/></Cell>");
+
+            output.WriteLine("</Row>");
+        }
+
+        private static void WriteCell (StreamWriter sw, string type, string value) {
+            var escaped = System.Security.SecurityElement.Escape(value);
+            sw.WriteLine($"                <Cell><Data ss:Type=\"{type}\">{escaped}</Data></Cell>");
+        }
+
         private static string GetNamespaceName (string name) {
             if (string.IsNullOrWhiteSpace(name))
                 return null;
@@ -274,11 +317,6 @@ namespace WasmStrip {
             } else {
                 return name.Substring(0, lastNsBreak + 2) + "*";
             }
-        }
-
-        private static void WriteCell (StreamWriter sw, string type, string value) {
-            var escaped = System.Security.SecurityElement.Escape(value);
-            sw.WriteLine($"                <Cell><Data ss:Type=\"{type}\">{escaped}</Data></Cell>");
         }
 
         private static string GetSignatureForType (func_type type) {
@@ -382,6 +420,8 @@ namespace WasmStrip {
             if (operand.StartsWith('"') && operand.EndsWith('"'))
                 operand = operand.Substring(1, operand.Length - 2);
 
+            arg = arg.Replace("-", "");
+
             switch (arg.ToLower()) {
                 case "report":
                 case "reportout":
@@ -416,6 +456,18 @@ namespace WasmStrip {
                     break;
                 case "retainlist":
                     TrySet(ref config.StripRetainListPath, operand);
+                    break;
+                case "dumpsections":
+                    if (string.IsNullOrWhiteSpace(operand))
+                        config.DumpSectionRegexes.Add(".*");
+                    else
+                        config.DumpSectionRegexes.Add(operand);
+                    break;
+                case "dumpsectionsout":
+                case "dumpsectionsoutput":
+                case "dumpsectionsto":
+                case "dumpsectionspath":
+                    config.DumpSectionsPath = operand;
                     break;
             }
         }
