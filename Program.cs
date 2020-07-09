@@ -16,7 +16,9 @@ namespace WasmStrip {
         public string ModulePath;
 
         public string ReportPath;
+
         public string GraphPath;
+        public List<Regex> GraphRegexes = new List<Regex>();
 
         public string DiffAgainst;
         public string DiffPath;
@@ -32,9 +34,11 @@ namespace WasmStrip {
     }
 
     class NamespaceInfo {
+        public int Index;
         public string Name;
         public uint FunctionCount;
         public uint SizeBytes;
+        public HashSet<NamespaceInfo> ChildNamespaces = new HashSet<NamespaceInfo>();
     }
 
     class FunctionInfo {
@@ -141,7 +145,7 @@ namespace WasmStrip {
                         GenerateReport(config, wasmStream, wasmReader, data);
 
                     if (config.GraphPath != null)
-                        ; // GenerateGraph(config, wasmStream, wasmReader, data);
+                        GenerateGraph(config, wasmStream, wasmReader, data);
 
                     Console.CursorLeft = 0;
                     Console.Write("Dumping raw data...                      ");
@@ -157,6 +161,7 @@ namespace WasmStrip {
                     Console.Error.WriteLine("Usage: WasmStrip module.wasm [--option ...] [@response.rsp]");
                     Console.Error.WriteLine("  --report-out=filename.xml");
                     Console.Error.WriteLine("  --graph-out=filename.dot");
+                    Console.Error.WriteLine("    --graph-filter=regex [...]");
                     Console.Error.WriteLine("  --diff-against=oldmodule.wasm --diff-out=filename.csv");
                     Console.Error.WriteLine("  --dump-sections[=regex] --dump-sections-to=outdir/");
                     /*
@@ -176,6 +181,11 @@ namespace WasmStrip {
             }
 
             return 0;
+        }
+
+        private static void EnsureValidPath (string filename) {
+            var directoryName = Path.GetDirectoryName(filename);
+            Directory.CreateDirectory(directoryName);
         }
 
         private static void DumpSections (Config config, BinaryReader wasmStream, WasmReader wasmReader) {
@@ -213,9 +223,102 @@ namespace WasmStrip {
             }
         }
 
+        private static void GenerateGraph (
+            Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data
+        ) {
+            EnsureValidPath(config.GraphPath);
+
+            using (var output = new StreamWriter(config.GraphPath, false, Encoding.UTF8)) {
+                output.WriteLine("digraph namespaces {");
+
+                const int maxLength = 20;
+                const int minCount = 2;
+
+                var namespaceDependencies = data.DependencyGraph.Where(dgn => dgn.NamespaceName != null).ToLookup(dgn => dgn.NamespaceName);
+
+                var referencedNamespaces = new HashSet<NamespaceInfo>();
+                foreach (var kvp in data.Namespaces) {
+                    if ((config.GraphRegexes.Count > 0) && !config.GraphRegexes.Any(gr => gr.IsMatch(kvp.Key)))
+                        continue;
+
+                    if (kvp.Value.FunctionCount < minCount)
+                        continue;
+
+                    foreach (var cns in kvp.Value.ChildNamespaces)
+                        referencedNamespaces.Add(cns);
+
+                    if (namespaceDependencies.Contains(kvp.Key)) {
+                        var dgn = namespaceDependencies[kvp.Key].First();
+
+                        foreach (var cn in dgn.ReferencedNamespaces)
+                            referencedNamespaces.Add(data.Namespaces[cn.NamespaceName]);
+                    }
+                }
+
+                var namespaces = new HashSet<NamespaceInfo>();
+                foreach (var kvp in data.Namespaces) {
+                    namespaces.Add(kvp.Value);
+
+                    if (namespaceDependencies.Contains(kvp.Key)) {
+                        var dgn = namespaceDependencies[kvp.Key].First();
+
+                        foreach (var rn in dgn.ReferencedNamespaces)
+                            namespaces.Add(data.Namespaces[rn.NamespaceName]);
+                    }
+                }
+
+                var labelsNeeded = new HashSet<NamespaceInfo>();
+
+                foreach (var nsi in namespaces) {
+                    if (!referencedNamespaces.Contains(nsi)) {
+                        if (nsi.FunctionCount < minCount)
+                            continue;
+
+                        if ((config.GraphRegexes.Count > 0) && !config.GraphRegexes.Any(gr => gr.IsMatch(nsi.Name)))
+                            continue;
+                    }
+
+                    labelsNeeded.Add(nsi);
+
+                    foreach (var cns in nsi.ChildNamespaces) {
+                        if (cns.FunctionCount < minCount)
+                            continue;
+
+                        output.WriteLine($"\t\"ns{nsi.Index.ToString()}\" -> \"ns{cns.Index.ToString()}\";");
+
+                        labelsNeeded.Add(nsi);
+                        labelsNeeded.Add(cns);
+                    }
+
+                    if (namespaceDependencies.Contains(nsi.Name)) {
+                        var dgn = namespaceDependencies[nsi.Name].First();
+
+                        foreach (var rn in dgn.ReferencedNamespaces) {
+                            var rni = data.Namespaces[rn.NamespaceName];
+                            labelsNeeded.Add(rni);
+                            output.WriteLine($"\t\"ns{nsi.Index.ToString()}\" -> \"ns{rni.Index.ToString()}\";");
+                        }
+                    }
+                }
+
+                foreach (var nsi in labelsNeeded) {
+                    var label = nsi.Name.Replace("*", "");
+                    if (label.Length > maxLength)
+                        label = label.Substring(0, maxLength);
+
+                    var color = config.GraphRegexes.Any(gr => gr.IsMatch(nsi.Name)) ? "AAAAAA" : "DFDFDF";
+                    output.WriteLine($"\t\"ns{nsi.Index.ToString()}\" [label=\"{label}\", style=\"filled\", color=\"#{color}\"];");
+                }
+
+                output.WriteLine("}");
+            }
+        }
+
         private static void GenerateReport (
             Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data
         ) {
+            EnsureValidPath(config.ReportPath);
+
             using (var output = new StreamWriter(config.ReportPath, false, Encoding.UTF8)) {
                 output.WriteLine(@"<?xml version=""1.0"" encoding=""UTF-8""?>
 <?mso-application progid=""Excel.Sheet""?>
@@ -240,19 +343,17 @@ namespace WasmStrip {
                     i++;
                 }
 
-                i = 0;
                 foreach (var ns in data.Namespaces.Values) {
                     if (ns.FunctionCount < 2)
                         continue;
 
                     output.WriteLine("            <Row>");
                     WriteCell(output, "String", "namespace");
-                    WriteCell(output, "Number", i.ToString());
+                    WriteCell(output, "Number", ns.Index.ToString());
                     WriteCell(output, "String", ns.Name);
                     WriteCell(output, "Number", ns.SizeBytes.ToString());
                     WriteCell(output, "String", $"{ns.FunctionCount:00000} function(s)");
                     output.WriteLine("            </Row>");
-                    i++;
                 }
 
                 foreach (var fn in data.Functions.Values) {
@@ -269,8 +370,8 @@ namespace WasmStrip {
 
                 WriteSheetHeader(
                     output, "Dependencies",
-                    new[] { 80, 500, 50, 50, 70, 70, 80 },
-                    new[] { "Type", "Name", "In", "Out", "Size", "Out (Deep)", "Size (Deep)" }
+                    new[] { 80, 500, 50, 50, 60, 70, 70, 80 },
+                    new[] { "Type", "Name", "In", "Out", "Out (NS)", "Size", "Out (Deep)", "Size (Deep)" }
                 );
 
                 foreach (var entry in data.DependencyGraph) {
@@ -279,13 +380,14 @@ namespace WasmStrip {
                     WriteCell(output, "String", entry.NamespaceName ?? (entry.Function.Name ?? $"#{entry.Function.Index}"));
                     WriteCell(output, "Number", entry.Dependents.ToString());
                     WriteCell(output, "Number", entry.DirectDependencyCount.ToString());
+                    WriteCell(output, "Number", entry.ReferencedNamespaces != null ? entry.ReferencedNamespaces.Count.ToString() : "");
                     WriteCell(output, "Number", entry.ShallowSize.ToString());
                     WriteCell(output, "Number", entry.DeepDependencies.ToString());
                     WriteCell(output, "Number", entry.DeepSize.ToString());
                     output.WriteLine("            </Row>");
                 }
 
-                WriteSheetFooter(output, 7);
+                WriteSheetFooter(output, 8);
 
                 output.WriteLine("</Workbook>");
             }
@@ -305,7 +407,8 @@ namespace WasmStrip {
             public int Dependents;
 
             public DependencyGraphNode ParentNamespace;
-            public List<DependencyGraphNode> ChildFunctions;
+            public HashSet<DependencyGraphNode> ChildFunctions;
+            public HashSet<DependencyGraphNode> ReferencedNamespaces;
 
             public int DirectDependencyCount {
                 get {
@@ -343,7 +446,8 @@ namespace WasmStrip {
                     if (!namespaceNodes.TryGetValue(namespaceName, out namespaceNode))
                         namespaceNode = namespaceNodes[namespaceName] = new DependencyGraphNode {
                             NamespaceName = namespaceName,
-                            ChildFunctions = new List<DependencyGraphNode>()
+                            ChildFunctions = new HashSet<DependencyGraphNode>(),
+                            ReferencedNamespaces = new HashSet<DependencyGraphNode>()
                         };
 
                     namespaceNode.ShallowSize += fnode.ShallowSize;
@@ -366,6 +470,9 @@ namespace WasmStrip {
                         kvp.Value.Recursions += 1;
                         continue;
                     }
+
+                    if ((kvp.Value.ParentNamespace != null) && (dep.ParentNamespace != null))
+                        kvp.Value.ParentNamespace.ReferencedNamespaces.Add(dep.ParentNamespace);
 
                     // Propagate dependencies upward
                     var upward = functionNodes[dep.Function];
@@ -487,19 +594,26 @@ namespace WasmStrip {
 
         private static Dictionary<string, NamespaceInfo> ComputeNamespaceSizes (AnalysisData data) {
             var namespaces = new Dictionary<string, NamespaceInfo>();
+            int i = 0;
             foreach (var fn in data.Functions.Values) {
                 if (string.IsNullOrWhiteSpace(fn.Name))
                     continue;
 
                 var namespaceName = fn.Name;
+                NamespaceInfo previousNamespace = null;
 
                 while ((namespaceName = GetNamespaceName(namespaceName)) != null) {
                     NamespaceInfo ns;
-                    if (!namespaces.TryGetValue(namespaceName, out ns))
-                        namespaces[namespaceName] = ns = new NamespaceInfo { Name = namespaceName };
+                    if (!namespaces.TryGetValue(namespaceName, out ns)) {
+                        namespaces[namespaceName] = ns = new NamespaceInfo { Name = namespaceName, Index = i++ };
+                    }
+
+                    if (previousNamespace != null)
+                        ns.ChildNamespaces.Add(previousNamespace);
 
                     ns.FunctionCount += 1;
                     ns.SizeBytes += fn.Body.body_size;
+                    previousNamespace = ns;
                 }
             }
 
@@ -569,16 +683,22 @@ namespace WasmStrip {
             if (firstParen < 0)
                 firstParen = name.Length;
 
+            string result;
             var lastNsBreak = name.LastIndexOf("::", Math.Min(firstParen, Math.Max(0, name.Length - 4)), StringComparison.Ordinal);
             if (lastNsBreak <= 0) {
                 var lastUnderscore = name.LastIndexOf("_", Math.Min(firstParen, Math.Max(0, name.Length - 3)), StringComparison.Ordinal);
                 if (lastUnderscore > 0)
-                    return name.Substring(0, lastUnderscore + 1) + "*";
+                    result = name.Substring(0, lastUnderscore + 1) + "*";
                 else
-                    return null;
+                    result = null;
             } else {
-                return name.Substring(0, lastNsBreak + 2) + "*";
+                result = name.Substring(0, lastNsBreak + 2) + "*";
             }
+
+            if (string.IsNullOrWhiteSpace(result) || (result.Trim() == "::"))
+                return null;
+            else
+                return result;
         }
 
         private static string GetSignatureForType (func_type type) {
@@ -679,6 +799,8 @@ namespace WasmStrip {
                 arg = arg.Substring(0, equalsOffset);
             }
 
+            operand = operand.Replace("\\\"", "\"");
+
             if (operand.StartsWith('"') && operand.EndsWith('"'))
                 operand = operand.Substring(1, operand.Length - 2);
 
@@ -696,6 +818,10 @@ namespace WasmStrip {
                 case "graphoutput":
                 case "graphpath":
                     config.GraphPath = operand;
+                    break;
+                case "graphregex":
+                case "graphfilter":
+                    config.GraphRegexes.Add(new Regex(operand));
                     break;
                 case "diff":
                 case "diffagainst":
