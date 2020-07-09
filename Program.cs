@@ -231,25 +231,26 @@ namespace WasmStrip {
 
                 WriteSheetHeader(
                     output, "Dependencies",
-                    new[] { 500, 70, 70, 70, 80, 80 },
-                    new[] { "Name", "In", "Out", "Size", "Out (Deep)", "Size (Deep)" }
+                    new[] { 80, 500, 50, 50, 70, 70, 80 },
+                    new[] { "Type", "Name", "In", "Out", "Size", "Out (Deep)", "Size (Deep)" }
                 );
 
                 var directDependencies = ComputeDirectDependencies(config, wasmStream, wasmReader, functions);
                 var dependencyGraph = ComputeDependencyGraph(config, functions, directDependencies);
 
-                foreach (var entry in dependencyGraph.Values) {
+                foreach (var entry in dependencyGraph) {
                     output.WriteLine("            <Row>");
-                    WriteCell(output, "String", entry.Function.Name ?? $"#{entry.Function.Index}");
+                    WriteCell(output, "String", entry.NamespaceName != null ? "namespace" : "function");
+                    WriteCell(output, "String", entry.NamespaceName ?? (entry.Function.Name ?? $"#{entry.Function.Index}"));
                     WriteCell(output, "Number", entry.Dependents.ToString());
-                    WriteCell(output, "Number", (entry.DirectDependencies?.Length ?? 0).ToString());
-                    WriteCell(output, "Number", entry.Function.Body.body_size.ToString());
+                    WriteCell(output, "Number", entry.DirectDependencyCount.ToString());
+                    WriteCell(output, "Number", entry.ShallowSize.ToString());
                     WriteCell(output, "Number", entry.DeepDependencies.ToString());
                     WriteCell(output, "Number", entry.DeepSize.ToString());
                     output.WriteLine("            </Row>");
                 }
 
-                WriteSheetFooter(output, 6);
+                WriteSheetFooter(output, 7);
 
                 output.WriteLine("</Workbook>");
             }
@@ -257,59 +258,122 @@ namespace WasmStrip {
 
         class DependencyGraphNode {
             public FunctionInfo Function;
+            public string NamespaceName;
 
+            public uint ShallowSize;
             public uint DeepSize;
 
-            public FunctionInfo[] DirectDependencies;
+            public DependencyGraphNode[] DirectDependencies;
             public int DeepDependencies;
 
             public int Recursions;
             public int Dependents;
+
+            public DependencyGraphNode ParentNamespace;
+            public List<DependencyGraphNode> ChildFunctions;
+
+            public int DirectDependencyCount {
+                get {
+                    if (Function != null)
+                        return DirectDependencies?.Length ?? 0;
+
+                    var hs = new HashSet<DependencyGraphNode>();
+                    foreach (var cf in ChildFunctions) {
+                        if (cf.DirectDependencies == null)
+                            continue;
+
+                        foreach (var dd in cf.DirectDependencies)
+                            hs.Add(dd);
+                    }
+                    return hs.Count;
+                }
+            }
         }
 
-        private static Dictionary<FunctionInfo, DependencyGraphNode> ComputeDependencyGraph (
+        private static DependencyGraphNode[] ComputeDependencyGraph (
             Config config, Dictionary<uint, FunctionInfo> functions, Dictionary<FunctionInfo, FunctionInfo[]> directDependencies
         ) {
-            var result = new Dictionary<FunctionInfo, DependencyGraphNode>();
-            foreach (var fn in functions.Values)
-                result[fn] = new DependencyGraphNode { Function = fn };
+            var namespaceNodes = new Dictionary<string, DependencyGraphNode>();
+            var functionNodes = new Dictionary<FunctionInfo, DependencyGraphNode>();
 
-            foreach (var kvp in result) {
-                if (!directDependencies.TryGetValue(kvp.Key, out kvp.Value.DirectDependencies))
+            foreach (var fn in functions.Values) {
+                var fnode = new DependencyGraphNode {
+                    Function = fn,
+                    ShallowSize = fn.Body.body_size
+                };
+
+                string namespaceName = fn.Name;
+                if ((namespaceName = GetNamespaceName(namespaceName)) != null) {
+                    DependencyGraphNode namespaceNode;
+                    if (!namespaceNodes.TryGetValue(namespaceName, out namespaceNode))
+                        namespaceNode = namespaceNodes[namespaceName] = new DependencyGraphNode {
+                            NamespaceName = namespaceName,
+                            ChildFunctions = new List<DependencyGraphNode>()
+                        };
+
+                    namespaceNode.ShallowSize += fnode.ShallowSize;
+                    namespaceNode.ChildFunctions.Add(fnode);
+                    fnode.ParentNamespace = namespaceNode;
+                }
+
+                functionNodes[fn] = fnode;
+            }
+
+            foreach (var kvp in functionNodes) {
+                FunctionInfo[] dd;
+                if (!directDependencies.TryGetValue(kvp.Key, out dd))
                     continue;
 
+                kvp.Value.DirectDependencies = (from fi in dd select functionNodes[fi]).ToArray();
+
                 foreach (var dep in kvp.Value.DirectDependencies) {
-                    if (dep == kvp.Key) {
+                    if (dep.Function == kvp.Key) {
                         kvp.Value.Recursions += 1;
                         continue;
                     }
 
                     // Propagate dependencies upward
-                    result[dep].Dependents += 1;
+                    var upward = functionNodes[dep.Function];
+                    upward.Dependents += 1;
+
+                    if (upward.ParentNamespace != null)
+                        upward.ParentNamespace.Dependents += 1;
                 }
             }
 
-            foreach (var kvp in result)
-                ComputeDeepDependencies(config, functions, result, kvp.Value);
+            foreach (var kvp in functionNodes)
+                ComputeDeepDependencies(config, functions, functionNodes, namespaceNodes, kvp.Value);
 
-            return result;
+            foreach (var kvp in namespaceNodes)
+                ComputeDeepDependencies(config, functions, functionNodes, namespaceNodes, kvp.Value);
+
+            return (from nsn in namespaceNodes.Values where nsn.ChildFunctions.Count > 1 select nsn).Concat(functionNodes.Values).ToArray();
         }
 
         private static void ComputeDeepDependencies (
             Config config, Dictionary<uint, FunctionInfo> functions,
-            Dictionary<FunctionInfo, DependencyGraphNode> graphNodes, DependencyGraphNode node
+            Dictionary<FunctionInfo, DependencyGraphNode> functionNodes, 
+            Dictionary<string, DependencyGraphNode> namespaceNodes,
+            DependencyGraphNode node
         ) {
-            node.DeepSize = node.Function.Body.body_size;
-
-            if (node.DirectDependencies == null)
-                return;
+            if (node.Function != null)
+                node.DeepSize = node.Function.Body.body_size;
+            else
+                node.DeepSize = 0;
 
             var seenList = new HashSet<FunctionInfo>();
             var todoList = new Queue<FunctionInfo>();
 
-            foreach (var dep in node.DirectDependencies) {
-                seenList.Add(dep);
-                todoList.Enqueue(dep);
+            if (node.DirectDependencies != null) {
+                foreach (var dep in node.DirectDependencies) {
+                    seenList.Add(dep.Function);
+                    todoList.Enqueue(dep.Function);
+                }
+            } else if (node.ChildFunctions != null) {
+                foreach (var cf in node.ChildFunctions) {
+                    seenList.Add(cf.Function);
+                    todoList.Enqueue(cf.Function);
+                }
             }
 
             while (todoList.Count > 0) {
@@ -318,14 +382,14 @@ namespace WasmStrip {
                 node.DeepSize += dep.Body.body_size;
                 node.DeepDependencies += 1;
 
-                var depNode = graphNodes[dep];
+                var depNode = functionNodes[dep];
                 if (depNode.DirectDependencies == null)
                     continue;
 
                 foreach (var subDep in depNode.DirectDependencies) {
-                    if (!seenList.Contains(subDep)) {
-                        seenList.Add(subDep);
-                        todoList.Enqueue(subDep);
+                    if (!seenList.Contains(subDep.Function)) {
+                        seenList.Add(subDep.Function);
+                        todoList.Enqueue(subDep.Function);
                     }
                 }
             }
