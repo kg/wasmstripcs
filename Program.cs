@@ -26,8 +26,8 @@ namespace WasmStrip {
         public string StripOutputPath;
         public string StripRetainListPath;
         public string StripListPath;
-        public List<string> StripRetainRegexes = new List<string>();
-        public List<string> StripRegexes = new List<string>();
+        public List<Regex> StripRetainRegexes = new List<Regex>();
+        public List<Regex> StripRegexes = new List<Regex>();
 
         public string DumpSectionsPath;
         public List<string> DumpSectionRegexes = new List<string>();
@@ -120,7 +120,7 @@ namespace WasmStrip {
                         functions[info.Index] = info;
                     };
 
-                    Console.Write("Reading module...                      ");
+                    Console.Write("Reading module...");
                     wasmReader.Read();
 
                     foreach (var kvp in wasmReader.FunctionNames) {
@@ -131,15 +131,13 @@ namespace WasmStrip {
                         functions[(uint)biasedIndex].Name = kvp.Value;
                     }
 
-                    Console.CursorLeft = 0;
-                    Console.Write("Analyzing module...                      ");
+                    ClearLine("Analyzing module.");
 
                     AnalysisData data = null;
                     if ((config.ReportPath != null) || (config.GraphPath != null))
                         data = new AnalysisData(config, wasmStream, wasmReader, functions);
 
-                    Console.CursorLeft = 0;
-                    Console.Write("Generating output...                      ");
+                    ClearLine("Generating reports...");
 
                     if (config.ReportPath != null)
                         GenerateReport(config, wasmStream, wasmReader, data);
@@ -147,14 +145,17 @@ namespace WasmStrip {
                     if (config.GraphPath != null)
                         GenerateGraph(config, wasmStream, wasmReader, data);
 
-                    Console.CursorLeft = 0;
-                    Console.Write("Dumping raw data...                      ");
+                    ClearLine("Dumping raw data...");
 
                     if (config.DumpSectionsPath != null)
                         DumpSections(config, wasmStream, wasmReader);
 
-                    Console.CursorLeft = 0;
-                    Console.WriteLine("OK.                                    ");
+                    ClearLine("Stripping methods...");
+                    if (config.StripOutputPath != null)
+                        GenerateStrippedModule(config, wasmStream, wasmReader);
+
+                    ClearLine("OK.");
+                    Console.WriteLine();
                 }
             } finally {
                 if (!execStarted) {
@@ -164,14 +165,12 @@ namespace WasmStrip {
                     Console.Error.WriteLine("    --graph-filter=regex [...]");
                     Console.Error.WriteLine("  --diff-against=oldmodule.wasm --diff-out=filename.csv");
                     Console.Error.WriteLine("  --dump-sections[=regex] --dump-sections-to=outdir/");
-                    /*
-                    Console.Error.WriteLine("  --out=newmodule.wasm");
+                    Console.Error.WriteLine("  --strip-out=newmodule.wasm");
                     Console.Error.WriteLine("    --strip-section=regex [...]");
                     Console.Error.WriteLine("    --strip=regex [...]");
                     Console.Error.WriteLine("    --strip-list=regexes.txt");
                     Console.Error.WriteLine("    --retain=regex [...]");
                     Console.Error.WriteLine("    --retain-list=regexes.txt");
-                    */
                 }
 
                 if (Debugger.IsAttached) {
@@ -181,6 +180,18 @@ namespace WasmStrip {
             }
 
             return 0;
+        }
+
+        private static void ClearLine (string newText = null) {
+            Console.CursorLeft = 0;
+            Console.Write(new string(' ', 50));
+            Console.CursorLeft = 0;
+            if (newText != null)
+                Console.Write(newText);
+        }
+
+        private static void GenerateStrippedModule (Config config, BinaryReader wasmStream, WasmReader wasmReader) {
+            throw new NotImplementedException();
         }
 
         private static void EnsureValidPath (string filename) {
@@ -218,7 +229,9 @@ namespace WasmStrip {
             public AnalysisData (Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
                 Functions = functions;
                 Namespaces = ComputeNamespaceSizes(this);
+                Console.Write(".");
                 DirectDependencies = ComputeDirectDependencies(config, wasmStream, wasmReader, this);
+                Console.Write(".");
                 DependencyGraph = ComputeDependencyGraph(config, this);
             }
         }
@@ -835,15 +848,18 @@ namespace WasmStrip {
                 case "output":
                 case "outpath":
                 case "out":
+                case "stripoutput":
+                case "stripoutpath":
+                case "stripout":
                     config.StripOutputPath = operand;
                     break;
                 case "retain":
                 case "retainRegex":
-                    config.StripRetainRegexes.Add(operand);
+                    config.StripRetainRegexes.Add(new Regex(operand));
                     break;
                 case "strip":
                 case "stripRegex":
-                    config.StripRegexes.Add(operand);
+                    config.StripRegexes.Add(new Regex(operand));
                     break;
                 case "striplist":
                     TrySet(ref config.StripListPath, operand);
