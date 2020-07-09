@@ -262,25 +262,110 @@ namespace WasmStrip {
         private static void GenerateStrippedCodeSection (Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions, SectionHeader sh, BinaryWriter output) {
             output.WriteLEB((uint)wasmReader.Code.bodies.Length);
 
-            using (var scratchBuffer = new MemoryStream(102400))
+            var scratchBuffer = new MemoryStream(102400);
             foreach (var body in wasmReader.Code.bodies) {
                 scratchBuffer.Position = 0;
                 scratchBuffer.SetLength(0);
 
-                using (var fb = GetFunctionBodyStream(body))
                 using (var scratch = new BinaryWriter(scratchBuffer, Encoding.UTF8, true)) {
-                    scratch.WriteLEB((uint)body.locals.Length);
-                    foreach (var l in body.locals) {
-                        scratch.WriteLEB(l.count);
-                        scratch.Write((byte)l.type);
+                    var fi = functions[body.Index];
+                    var name = fi.Name ?? $"#{body.Index}";
+
+                    var retain = config.StripRetainRegexes.Any(r => r.IsMatch(name));
+                    var strip = config.StripRegexes.Any(r => r.IsMatch(name));
+
+                    if (strip && !retain) {
+                        Console.WriteLine($"// Stripping {name}");
+                        GenerateStrippedFunctionBody(body, scratch);
+                    } else {
+                        CopyExistingFunctionBody(body, scratch);
                     }
 
                     scratch.Flush();
-                    fb.CopyTo(scratchBuffer);
-
                     output.WriteLEB((uint)scratchBuffer.Position);
                     output.Write(scratchBuffer.GetBuffer(), 0, (int)scratchBuffer.Position);
                 }
+            }
+        }
+
+
+        private static void EmitExpression (
+            BinaryWriter writer, ref Expression e
+        ) {
+            writer.Write((byte)e.Opcode);
+
+            switch (e.Body.Type & ~ExpressionBody.Types.children) {
+                case ExpressionBody.Types.none:
+                    break;
+
+                case ExpressionBody.Types.u32:
+                    writer.WriteLEB(e.Body.U.u32);
+                    break;
+                case ExpressionBody.Types.u1:
+                    writer.Write((byte)e.Body.U.u32);
+                    break;
+                case ExpressionBody.Types.i64:
+                    writer.WriteLEB(e.Body.U.i64);
+                    break;
+                case ExpressionBody.Types.i32:
+                    writer.WriteLEB(e.Body.U.i32);
+                    break;
+                case ExpressionBody.Types.f64:
+                    writer.Write(e.Body.U.f64);
+                    break;
+                case ExpressionBody.Types.f32:
+                    writer.Write(e.Body.U.f32);
+                    break;
+                case ExpressionBody.Types.memory:
+                    writer.WriteLEB(e.Body.U.memory.flags);
+                    writer.WriteLEB(e.Body.U.memory.offset);
+                    break;
+                case ExpressionBody.Types.type:
+                    writer.Write((byte)e.Body.U.type);
+                    break;
+                case ExpressionBody.Types.br_table:
+                    writer.WriteLEB((uint)e.Body.br_table.target_table.Length);
+                    foreach (var t in e.Body.br_table.target_table)
+                        writer.WriteLEB(t);
+                    writer.WriteLEB(e.Body.br_table.default_target);
+                    break;
+
+                default:
+                    throw new NotImplementedException();
+            }
+
+            if (e.Opcode == Opcodes.call_indirect)
+                throw new NotImplementedException();
+
+            if (e.Body.children != null) {
+                Expression c;
+                for (int i = 0; i < e.Body.children.Count; i++) {
+                    c = e.Body.children[i];
+                    EmitExpression(writer, ref c);
+                }
+            }
+        }
+
+        private static void GenerateStrippedFunctionBody (function_body body, BinaryWriter output) {
+            output.WriteLEB((uint)0);
+
+            var expr = new Expression {
+                Opcode = Opcodes.unreachable,
+                State = ExpressionState.Initialized
+            };
+            EmitExpression(output, ref expr);
+        }
+
+        private static void CopyExistingFunctionBody (function_body body, BinaryWriter output) {
+            using (var fb = GetFunctionBodyStream(body)) {
+                output.WriteLEB((uint)body.locals.Length);
+                foreach (var l in body.locals) {
+                    output.WriteLEB(l.count);
+                    output.Write((byte)l.type);
+                }
+
+                output.Flush();
+                fb.CopyTo(output.BaseStream);
             }
         }
 
