@@ -231,7 +231,7 @@ namespace WasmStrip {
             using (var output = new StreamWriter(config.GraphPath, false, Encoding.UTF8)) {
                 output.WriteLine("digraph namespaces {");
 
-                const int maxLength = 20;
+                const int maxLength = 24;
                 const int minCount = 2;
 
                 var namespaceDependencies = data.DependencyGraph.Where(dgn => dgn.NamespaceName != null).ToLookup(dgn => dgn.NamespaceName);
@@ -304,7 +304,7 @@ namespace WasmStrip {
                 foreach (var nsi in labelsNeeded) {
                     var label = nsi.Name.Replace("*", "");
                     if (label.Length > maxLength)
-                        label = label.Substring(0, maxLength);
+                        label = label.Substring(0, maxLength) + "...";
 
                     var color = config.GraphRegexes.Any(gr => gr.IsMatch(nsi.Name)) ? "AAAAAA" : "DFDFDF";
                     output.WriteLine($"\t\"ns{nsi.Index.ToString()}\" [label=\"{label}\", style=\"filled\", color=\"#{color}\"];");
