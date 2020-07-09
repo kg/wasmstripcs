@@ -10,6 +10,7 @@ using System.Text.RegularExpressions;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Wasm.Model;
+using ModuleSaw;
 
 namespace WasmStrip {
     class Config {
@@ -152,7 +153,7 @@ namespace WasmStrip {
 
                     ClearLine("Stripping methods...");
                     if (config.StripOutputPath != null)
-                        GenerateStrippedModule(config, wasmStream, wasmReader);
+                        GenerateStrippedModule(config, wasmStream, wasmReader, functions);
 
                     ClearLine("OK.");
                     Console.WriteLine();
@@ -190,13 +191,82 @@ namespace WasmStrip {
                 Console.Write(newText);
         }
 
-        private static void GenerateStrippedModule (Config config, BinaryReader wasmStream, WasmReader wasmReader) {
-            throw new NotImplementedException();
-        }
-
         private static void EnsureValidPath (string filename) {
             var directoryName = Path.GetDirectoryName(filename);
             Directory.CreateDirectory(directoryName);
+        }
+
+        private static StreamWindow GetSectionStream (BinaryReader stream, SectionHeader header, bool includeHeader) {
+            var startOffset = includeHeader ? header.StreamHeaderStart : header.StreamPayloadStart;
+            return new StreamWindow(stream.BaseStream, startOffset, header.StreamPayloadEnd - startOffset);
+        }
+
+        private static void GenerateStrippedModule (
+            Config config, BinaryReader wasmStream, WasmReader wasmReader,
+            Dictionary<uint, FunctionInfo> functions
+        ) {
+            EnsureValidPath(config.StripOutputPath);
+
+            using (var o = new BinaryWriter(File.OpenWrite(config.StripOutputPath), Encoding.UTF8, false)) {
+                o.BaseStream.SetLength(0);
+
+                o.Write((uint)0x6d736100);
+                o.Write((uint)1);
+
+                foreach (var sh in wasmReader.SectionHeaders) {
+                    switch (sh.id) {
+                        case SectionTypes.Code:
+                            using (var sectionScratch = new MemoryStream(1024 * 1024))
+                            using (var sectionScratchWriter = new BinaryWriter(sectionScratch, Encoding.UTF8, true)) {
+                                GenerateStrippedCodeSection(config, wasmStream, wasmReader, functions, sh, sectionScratchWriter);
+                                sectionScratchWriter.Flush();
+
+                                o.Write((byte)sh.id);
+                                o.WriteLEB((uint)sectionScratch.Length);
+                                o.Flush();
+
+                                sectionScratch.Position = 0;
+                                sectionScratch.CopyTo(o.BaseStream);
+                            }
+                            break;
+
+                        default:
+                            using (var ss = GetSectionStream(wasmStream, sh, true)) {
+                                o.Flush();
+
+                                ss.Position = 0;
+                                ss.CopyTo(o.BaseStream);
+                            }
+                            break;
+                    }
+                }
+            }
+        }
+
+        private static void GenerateStrippedCodeSection (Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions, SectionHeader sh, BinaryWriter output) {
+            output.WriteLEB((uint)wasmReader.Code.bodies.Length);
+
+            using (var scratchBuffer = new MemoryStream(102400))
+            foreach (var body in wasmReader.Code.bodies) {
+                scratchBuffer.Position = 0;
+                scratchBuffer.SetLength(0);
+
+                using (var fb = GetFunctionBodyStream(body))
+                using (var scratch = new BinaryWriter(scratchBuffer, Encoding.UTF8, true)) {
+                    scratch.WriteLEB((uint)body.locals.Length);
+                    foreach (var l in body.locals) {
+                        scratch.WriteLEB(l.count);
+                        scratch.Write((byte)l.type);
+                    }
+
+                    scratch.Flush();
+                    fb.Position = 0;
+                    fb.CopyTo(scratchBuffer);
+
+                    output.WriteLEB((uint)scratchBuffer.Position);
+                    output.Write(scratchBuffer.GetBuffer(), 0, (int)scratchBuffer.Position);
+                }
+            }
         }
 
         private static void DumpSections (Config config, BinaryReader wasmStream, WasmReader wasmReader) {
@@ -214,8 +284,8 @@ namespace WasmStrip {
 
                 using (var outStream = File.OpenWrite(path)) {
                     outStream.SetLength(0);
-                    var sw = new ModuleSaw.StreamWindow(wasmStream.BaseStream, sh.StreamPayloadStart, sh.StreamPayloadEnd - sh.StreamPayloadStart);
-                    sw.CopyTo(outStream);
+                    using (var sw = GetSectionStream(wasmStream, sh, false))
+                        sw.CopyTo(outStream);
                 }
             }
         }
@@ -567,13 +637,15 @@ namespace WasmStrip {
             return result;
         }
 
+        private static StreamWindow GetFunctionBodyStream (function_body function) {
+            return new StreamWindow(function.Stream, function.StreamOffset, function.StreamEnd - function.StreamOffset);
+        }
+
         private static void GatherDirectDependencies (
             Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data, 
             FunctionInfo function, HashSet<FunctionInfo> dependencies
         ) {
-            using (var subStream = new ModuleSaw.StreamWindow(
-                function.Body.Stream, function.Body.StreamOffset, function.Body.StreamEnd - function.Body.StreamOffset)
-            ) {
+            using (var subStream = GetFunctionBodyStream(function.Body)) {
                 var reader = new ExpressionReader(new BinaryReader(subStream));
 
                 Expression expr;
