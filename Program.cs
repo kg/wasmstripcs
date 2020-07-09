@@ -41,7 +41,6 @@ namespace WasmStrip {
         public func_type Type;
         public function_body Body;
         public string Name;
-        public List<string> ExportNames;
         public int LocalsSize;
         public int NumLocals;
     }
@@ -117,7 +116,7 @@ namespace WasmStrip {
                     wasmReader.Read();
 
                     foreach (var kvp in wasmReader.FunctionNames) {
-                        var biasedIndex = (kvp.Key - wasmReader.ImportedFunctionCount);
+                        var biasedIndex = (kvp.Key - (int)wasmReader.ImportedFunctionCount);
                         if (biasedIndex < 0)
                             continue;
 
@@ -177,21 +176,15 @@ namespace WasmStrip {
         }
 
         private static void GenerateReport (Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
-            var lastFolder = Path.GetFileName(Path.GetDirectoryName(config.ModulePath));
-            var sheetName = Path.Combine(lastFolder, Path.GetFileName(config.ModulePath)).Replace('\\', '|').Replace('/', '|');
-
             using (var output = new StreamWriter(config.ReportPath, false, Encoding.UTF8)) {
                 output.WriteLine(@"<?xml version=""1.0"" encoding=""UTF-8""?>
 <?mso-application progid=""Excel.Sheet""?>
 <Workbook xmlns=""urn:schemas-microsoft-com:office:spreadsheet"" xmlns:x=""urn:schemas-microsoft-com:office:excel"" xmlns:ss=""urn:schemas-microsoft-com:office:spreadsheet"" xmlns:html=""https://www.w3.org/TR/html401/"">"
                 );
 
-                output.WriteLine($"<Worksheet ss:Name=\"{sheetName}\">");
-                output.WriteLine($"<Names><NamedRange ss:Name=\"_FilterDatabase\" ss:RefersTo=\"='{sheetName}'!R1C1:R1C5\" ss:Hidden=\"1\"/></Names>");
-                output.WriteLine($"<Table>");
-
-                WriteColumns(
+                WriteSheetHeader(
                     output,
+                    "Sizes",
                     new[] { 70, 60, 350, 70, 100 },
                     new[] { "Type", "Index", "Name", "Size (Bytes)", "Signature" }
                 );
@@ -207,22 +200,7 @@ namespace WasmStrip {
                     i++;
                 }
 
-                var namespaces = new Dictionary<string, NamespaceInfo>();
-                foreach (var fn in functions.Values) {
-                    if (string.IsNullOrWhiteSpace(fn.Name))
-                        continue;
-
-                    var namespaceName = fn.Name;
-
-                    while ((namespaceName = GetNamespaceName(namespaceName)) != null) {
-                        NamespaceInfo ns;
-                        if (!namespaces.TryGetValue(namespaceName, out ns))
-                            namespaces[namespaceName] = ns = new NamespaceInfo { Name = namespaceName };
-
-                        ns.FunctionCount += 1;
-                        ns.SizeBytes += fn.Body.body_size;
-                    }
-                }
+                var namespaces = ComputeNamespaceSizes(functions);
 
                 i = 0;
                 foreach (var ns in namespaces.Values) {
@@ -249,7 +227,206 @@ namespace WasmStrip {
                     output.WriteLine("            </Row>");
                 }
 
-                output.WriteLine(@"        </Table>
+                WriteSheetFooter(output, 5);
+
+                WriteSheetHeader(
+                    output, "Dependencies",
+                    new[] { 500, 70, 70, 70, 80, 80 },
+                    new[] { "Name", "In", "Out", "Size", "Out (Deep)", "Size (Deep)" }
+                );
+
+                var directDependencies = ComputeDirectDependencies(config, wasmStream, wasmReader, functions);
+                var dependencyGraph = ComputeDependencyGraph(config, functions, directDependencies);
+
+                foreach (var entry in dependencyGraph.Values) {
+                    output.WriteLine("            <Row>");
+                    WriteCell(output, "String", entry.Function.Name ?? $"#{entry.Function.Index}");
+                    WriteCell(output, "Number", entry.Dependents.ToString());
+                    WriteCell(output, "Number", (entry.DirectDependencies?.Length ?? 0).ToString());
+                    WriteCell(output, "Number", entry.Function.Body.body_size.ToString());
+                    WriteCell(output, "Number", entry.DeepDependencies.ToString());
+                    WriteCell(output, "Number", entry.DeepSize.ToString());
+                    output.WriteLine("            </Row>");
+                }
+
+                WriteSheetFooter(output, 6);
+
+                output.WriteLine("</Workbook>");
+            }
+        }
+
+        class DependencyGraphNode {
+            public FunctionInfo Function;
+
+            public uint DeepSize;
+
+            public FunctionInfo[] DirectDependencies;
+            public int DeepDependencies;
+
+            public int Recursions;
+            public int Dependents;
+        }
+
+        private static Dictionary<FunctionInfo, DependencyGraphNode> ComputeDependencyGraph (
+            Config config, Dictionary<uint, FunctionInfo> functions, Dictionary<FunctionInfo, FunctionInfo[]> directDependencies
+        ) {
+            var result = new Dictionary<FunctionInfo, DependencyGraphNode>();
+            foreach (var fn in functions.Values)
+                result[fn] = new DependencyGraphNode { Function = fn };
+
+            foreach (var kvp in result) {
+                if (!directDependencies.TryGetValue(kvp.Key, out kvp.Value.DirectDependencies))
+                    continue;
+
+                foreach (var dep in kvp.Value.DirectDependencies) {
+                    if (dep == kvp.Key) {
+                        kvp.Value.Recursions += 1;
+                        continue;
+                    }
+
+                    // Propagate dependencies upward
+                    result[dep].Dependents += 1;
+                }
+            }
+
+            foreach (var kvp in result)
+                ComputeDeepDependencies(config, functions, result, kvp.Value);
+
+            return result;
+        }
+
+        private static void ComputeDeepDependencies (
+            Config config, Dictionary<uint, FunctionInfo> functions,
+            Dictionary<FunctionInfo, DependencyGraphNode> graphNodes, DependencyGraphNode node
+        ) {
+            node.DeepSize = node.Function.Body.body_size;
+
+            if (node.DirectDependencies == null)
+                return;
+
+            var seenList = new HashSet<FunctionInfo>();
+            var todoList = new Queue<FunctionInfo>();
+
+            foreach (var dep in node.DirectDependencies) {
+                seenList.Add(dep);
+                todoList.Enqueue(dep);
+            }
+
+            while (todoList.Count > 0) {
+                var dep = todoList.Dequeue();
+
+                node.DeepSize += dep.Body.body_size;
+                node.DeepDependencies += 1;
+
+                var depNode = graphNodes[dep];
+                if (depNode.DirectDependencies == null)
+                    continue;
+
+                foreach (var subDep in depNode.DirectDependencies) {
+                    if (!seenList.Contains(subDep)) {
+                        seenList.Add(subDep);
+                        todoList.Enqueue(subDep);
+                    }
+                }
+            }
+        }
+
+        private static Dictionary<FunctionInfo, FunctionInfo[]> ComputeDirectDependencies (
+            Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions
+        ) {
+            var result = new Dictionary<FunctionInfo, FunctionInfo[]>();
+            var temp = new HashSet<FunctionInfo>();
+
+            foreach (var fn in functions.Values) {
+                temp.Clear();
+                GatherDirectDependencies(config, wasmStream, wasmReader, functions, fn, temp);
+
+                if (temp.Count > 0)
+                    result[fn] = temp.ToArray();
+            }
+
+            return result;
+        }
+
+        private static void GatherDirectDependencies (
+            Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions, 
+            FunctionInfo function, HashSet<FunctionInfo> dependencies
+        ) {
+            using (var subStream = new ModuleSaw.StreamWindow(
+                function.Body.Stream, function.Body.StreamOffset, function.Body.StreamEnd - function.Body.StreamOffset)
+            ) {
+                var reader = new ExpressionReader(new BinaryReader(subStream));
+
+                Expression expr;
+                while (reader.TryReadExpression(out expr)) {
+                    if (!reader.TryReadExpressionBody(ref expr))
+                        throw new Exception($"Failed to read body of {expr.Opcode}");
+
+                    GatherDirectDependencies(expr, wasmReader, functions, dependencies);
+                }
+            }
+        }
+
+        private static void GatherDirectDependencies (Expression expr, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions, HashSet<FunctionInfo> dependencies) {
+            if (expr.Opcode == Opcodes.call) {
+                var index = expr.Body.U.u32;
+                if (index < wasmReader.ImportedFunctionCount) {
+                    // Calling an import
+                } else {
+                    index -= wasmReader.ImportedFunctionCount;
+                    FunctionInfo callee;
+                    if (!functions.TryGetValue(index, out callee))
+                        throw new Exception($"Invalid call target: {index}");
+                    else
+                        dependencies.Add(callee);
+                }
+            } else if ((expr.Body.children != null) && (expr.Body.children.Count > 0)) {
+                foreach (var child in expr.Body.children)
+                    GatherDirectDependencies(child, wasmReader, functions, dependencies);
+            }
+        }
+
+        private static Dictionary<string, NamespaceInfo> ComputeNamespaceSizes (Dictionary<uint, FunctionInfo> functions) {
+            var namespaces = new Dictionary<string, NamespaceInfo>();
+            foreach (var fn in functions.Values) {
+                if (string.IsNullOrWhiteSpace(fn.Name))
+                    continue;
+
+                var namespaceName = fn.Name;
+
+                while ((namespaceName = GetNamespaceName(namespaceName)) != null) {
+                    NamespaceInfo ns;
+                    if (!namespaces.TryGetValue(namespaceName, out ns))
+                        namespaces[namespaceName] = ns = new NamespaceInfo { Name = namespaceName };
+
+                    ns.FunctionCount += 1;
+                    ns.SizeBytes += fn.Body.body_size;
+                }
+            }
+
+            return namespaces;
+        }
+
+        private static void WriteSheetHeader (StreamWriter output, string sheetName, int[] widths, string[] labels) {
+            if (widths.Length != labels.Length)
+                throw new ArgumentException();
+
+            output.WriteLine($"<Worksheet ss:Name=\"{sheetName}\">");
+            output.WriteLine($"<Names><NamedRange ss:Name=\"_FilterDatabase\" ss:RefersTo=\"='{sheetName}'!R1C1:R1C{widths.Length}\" ss:Hidden=\"1\"/></Names>");
+            output.WriteLine($"<Table>");
+
+            for (var i = 0; i < widths.Length; i++)
+                output.WriteLine($"<Column ss:Index=\"{i + 1}\" ss:Width=\"{widths[i]}\" />");
+
+            output.WriteLine("<Row>");
+            for (var i = 0; i < labels.Length; i++)
+                output.WriteLine($"<Cell><Data ss:Type=\"String\">{labels[i]}</Data><NamedCell ss:Name=\"_FilterDatabase\"/></Cell>");
+
+            output.WriteLine("</Row>");
+        }
+
+        private static void WriteSheetFooter (StreamWriter output, int columnCount) {
+            output.WriteLine(@"        </Table>
         <WorksheetOptions xmlns=""urn:schemas-microsoft-com:office:excel"">
             <FreezePanes/>
             <FrozenNoSplit/>
@@ -264,23 +441,9 @@ namespace WasmStrip {
                     <Number>2</Number>
                 </Pane>
             </Panes>
-        </WorksheetOptions>
-        <AutoFilter x:Range=""R1C1:R1C5"" xmlns=""urn:schemas-microsoft-com:office:excel""></AutoFilter>
-    </Worksheet>
-</Workbook>");
-
-            }
-        }
-
-        private static void WriteColumns (StreamWriter output, int[] widths, string[] labels) {
-            for (var i = 0; i < widths.Length; i++)
-                output.WriteLine($"<Column ss:Index=\"{i + 1}\" ss:Width=\"{widths[i]}\" />");
-
-            output.WriteLine("<Row>");
-            for (var i = 0; i < labels.Length; i++)
-                output.WriteLine($"<Cell><Data ss:Type=\"String\">{labels[i]}</Data><NamedCell ss:Name=\"_FilterDatabase\"/></Cell>");
-
-            output.WriteLine("</Row>");
+        </WorksheetOptions>");
+            output.WriteLine($"<AutoFilter x:Range=\"R1C1:R1C{columnCount}\" xmlns=\"urn:schemas-microsoft-com:office:excel\"></AutoFilter>");
+            output.WriteLine("</Worksheet>");
         }
 
         private static void WriteCell (StreamWriter sw, string type, string value) {
