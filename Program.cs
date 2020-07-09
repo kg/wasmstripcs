@@ -29,6 +29,7 @@ namespace WasmStrip {
         public string StripListPath;
         public List<Regex> StripRetainRegexes = new List<Regex>();
         public List<Regex> StripRegexes = new List<Regex>();
+        public string StripReportPath;
 
         public bool VerifyOutput = true;
 
@@ -112,8 +113,7 @@ namespace WasmStrip {
 
                 Console.WriteLine($"Processing module {config.ModulePath}...");
 
-                var wasmBytes = File.ReadAllBytes(config.ModulePath);
-                var wasmStream = new BinaryReader(new MemoryStream(wasmBytes), System.Text.Encoding.UTF8, false);
+                var wasmStream = ReadModule(config.ModulePath);
                 var functions = new Dictionary<uint, FunctionInfo>();
                 WasmReader wasmReader;
                 using (wasmStream) {
@@ -126,13 +126,7 @@ namespace WasmStrip {
                     Console.Write("Reading module...");
                     wasmReader.Read();
 
-                    foreach (var kvp in wasmReader.FunctionNames) {
-                        var biasedIndex = (kvp.Key - (int)wasmReader.ImportedFunctionCount);
-                        if (biasedIndex < 0)
-                            continue;
-
-                        functions[(uint)biasedIndex].Name = kvp.Value;
-                    }
+                    AssignFunctionNames(functions, wasmReader);
 
                     ClearLine("Analyzing module.");
 
@@ -143,10 +137,10 @@ namespace WasmStrip {
                     ClearLine("Generating reports...");
 
                     if (config.ReportPath != null)
-                        GenerateReport(config, wasmStream, wasmReader, data);
+                        GenerateReport(config, wasmStream, wasmReader, data, config.ReportPath);
 
                     if (config.GraphPath != null)
-                        GenerateGraph(config, wasmStream, wasmReader, data);
+                        GenerateGraph(config, wasmStream, wasmReader, data, config.GraphPath);
 
                     ClearLine("Dumping raw data...");
 
@@ -157,9 +151,28 @@ namespace WasmStrip {
                     if (config.StripOutputPath != null) {
                         GenerateStrippedModule(config, wasmStream, wasmReader, functions);
 
-                        if (config.VerifyOutput) {
-                            ClearLine("Verifying stripped module...");
-                            VerifyModule(config.StripOutputPath);
+                        var shouldReadOutput = config.VerifyOutput || (config.StripReportPath != null);
+                        if (shouldReadOutput) {
+                            var resultFunctions = new Dictionary<uint, FunctionInfo>();
+
+                            using (var resultReader = ReadModule(config.StripOutputPath)) {
+                                ClearLine("Reading stripped module...");
+                                var resultWasmReader = new WasmReader(resultReader);
+                                resultWasmReader.FunctionBodyCallback = (fb, br) => {
+                                    var info = ProcessFunctionBody(resultWasmReader, fb, br, config);
+                                    resultFunctions[info.Index] = info;
+                                };
+                                resultWasmReader.Read();
+
+                                AssignFunctionNames(resultFunctions, resultWasmReader);
+
+                                if (config.StripReportPath != null) {
+                                    ClearLine("Analyzing stripped module.");
+                                    var newData = new AnalysisData(config, resultReader, resultWasmReader, resultFunctions);
+
+                                    GenerateReport(config, resultReader, resultWasmReader, newData, config.StripReportPath);
+                                }
+                            }
                         }
                     }
 
@@ -191,6 +204,22 @@ namespace WasmStrip {
             return 0;
         }
 
+        private static void AssignFunctionNames (Dictionary<uint, FunctionInfo> functions, WasmReader wasmReader) {
+            foreach (var kvp in wasmReader.FunctionNames) {
+                var biasedIndex = (kvp.Key - (int)wasmReader.ImportedFunctionCount);
+                if (biasedIndex < 0)
+                    continue;
+
+                functions[(uint)biasedIndex].Name = kvp.Value;
+            }
+        }
+
+        private static BinaryReader ReadModule (string path) {
+            var wasmBytes = File.ReadAllBytes(path);
+            var stream = new MemoryStream(wasmBytes);
+            return new BinaryReader(stream, Encoding.UTF8, false);
+        }
+
         private static void ClearLine (string newText = null) {
             Console.CursorLeft = 0;
             Console.Write(new string(' ', 50));
@@ -207,14 +236,6 @@ namespace WasmStrip {
         private static StreamWindow GetSectionStream (BinaryReader stream, SectionHeader header, bool includeHeader) {
             var startOffset = includeHeader ? header.StreamHeaderStart - 1 : header.StreamPayloadStart;
             return new StreamWindow(stream.BaseStream, startOffset, header.StreamPayloadEnd - startOffset);
-        }
-
-        private static void VerifyModule (string path) {
-            using (var s = File.OpenRead(path))
-            using (var br = new BinaryReader(s, Encoding.UTF8, true)) {
-                var wr = new WasmReader(br);
-                wr.Read();
-            }
         }
 
         private static void GenerateStrippedModule (
@@ -354,6 +375,8 @@ namespace WasmStrip {
                 State = ExpressionState.Initialized
             };
             EmitExpression(output, ref expr);
+            expr.Opcode = Opcodes.end;
+            EmitExpression(output, ref expr);
         }
 
         private static void CopyExistingFunctionBody (function_body body, BinaryWriter output) {
@@ -402,16 +425,16 @@ namespace WasmStrip {
                 Console.Write(".");
                 DirectDependencies = ComputeDirectDependencies(config, wasmStream, wasmReader, this);
                 Console.Write(".");
-                DependencyGraph = ComputeDependencyGraph(config, this);
+                DependencyGraph = ComputeDependencyGraph(config, wasmStream, wasmReader, this);
             }
         }
 
         private static void GenerateGraph (
-            Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data
+            Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data, string path
         ) {
-            EnsureValidPath(config.GraphPath);
+            EnsureValidPath(path);
 
-            using (var output = new StreamWriter(config.GraphPath, false, Encoding.UTF8)) {
+            using (var output = new StreamWriter(path, false, Encoding.UTF8)) {
                 output.WriteLine("digraph namespaces {");
 
                 const int maxLength = 24;
@@ -498,11 +521,11 @@ namespace WasmStrip {
         }
 
         private static void GenerateReport (
-            Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data
+            Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data, string path
         ) {
-            EnsureValidPath(config.ReportPath);
+            EnsureValidPath(path);
 
-            using (var output = new StreamWriter(config.ReportPath, false, Encoding.UTF8)) {
+            using (var output = new StreamWriter(path, false, Encoding.UTF8)) {
                 output.WriteLine(@"<?xml version=""1.0"" encoding=""UTF-8""?>
 <?mso-application progid=""Excel.Sheet""?>
 <Workbook xmlns=""urn:schemas-microsoft-com:office:spreadsheet"" xmlns:x=""urn:schemas-microsoft-com:office:excel"" xmlns:ss=""urn:schemas-microsoft-com:office:spreadsheet"" xmlns:html=""https://www.w3.org/TR/html401/"">"
@@ -520,7 +543,7 @@ namespace WasmStrip {
                     output.WriteLine("            <Row>");
                     WriteCell(output, "String", "section");
                     WriteCell(output, "Number", i.ToString());
-                    WriteCell(output, "String", $"{sh.id.ToString()}{(string.IsNullOrWhiteSpace(sh.name) ? "" : " '" + sh.name + "'")}");
+                    WriteCell(output, "String", $"{sh.id} ({(byte)sh.id}) {(string.IsNullOrWhiteSpace(sh.name) ? "" : " '" + sh.name + "'")}");
                     WriteCell(output, "Number", sh.payload_len.ToString());
                     output.WriteLine("            </Row>");
                     i++;
@@ -543,7 +566,7 @@ namespace WasmStrip {
                     output.WriteLine("            <Row>");
                     WriteCell(output, "String", "function");
                     WriteCell(output, "Number", fn.Index.ToString());
-                    WriteCell(output, "String", fn.Name ?? "");
+                    WriteCell(output, "String", fn.Name ?? $"#{fn.Index}");
                     WriteCell(output, "Number", fn.Body.body_size.ToString());
                     WriteCell(output, "String", GetSignatureForType(fn.Type));
                     output.WriteLine("            </Row>");
@@ -553,8 +576,8 @@ namespace WasmStrip {
 
                 WriteSheetHeader(
                     output, "Dependencies",
-                    new[] { 80, 500, 50, 50, 60, 70, 70, 80 },
-                    new[] { "Type", "Name", "In", "Out", "Out (NS)", "Size", "Out (Deep)", "Size (Deep)" }
+                    new[] { 80, 500, 50, 50, 60, 70, 70, 80, 60, 60 },
+                    new[] { "Type", "Name", "In", "Out", "Out (NS)", "Size", "Out (Deep)", "Size (Deep)", "Exported", "Addressible" }
                 );
 
                 foreach (var entry in data.DependencyGraph) {
@@ -567,10 +590,12 @@ namespace WasmStrip {
                     WriteCell(output, "Number", entry.ShallowSize.ToString());
                     WriteCell(output, "Number", entry.DeepDependencies.ToString());
                     WriteCell(output, "Number", entry.DeepSize.ToString());
+                    WriteCell(output, "String", entry.TimesExported > 0 ? "yes" : "no");
+                    WriteCell(output, "String", entry.TimesInTable > 0 ? "yes" : "no");
                     output.WriteLine("            </Row>");
                 }
 
-                WriteSheetFooter(output, 8);
+                WriteSheetFooter(output, 10);
 
                 output.WriteLine("</Workbook>");
             }
@@ -588,6 +613,8 @@ namespace WasmStrip {
 
             public int Recursions;
             public int Dependents;
+
+            public int TimesExported, TimesInTable;
 
             public DependencyGraphNode ParentNamespace;
             public HashSet<DependencyGraphNode> ChildFunctions;
@@ -612,7 +639,7 @@ namespace WasmStrip {
         }
 
         private static DependencyGraphNode[] ComputeDependencyGraph (
-            Config config, AnalysisData data
+            Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data
         ) {
             var namespaceNodes = new Dictionary<string, DependencyGraphNode>();
             var functionNodes = new Dictionary<FunctionInfo, DependencyGraphNode>();
@@ -640,6 +667,68 @@ namespace WasmStrip {
 
                 functionNodes[fn] = fnode;
             }
+
+            if ((wasmReader.Tables.entries?.Length ?? 0) > 0)
+                throw new NotImplementedException("Unexpected tables");
+
+            var table = new uint[1];
+            foreach (var elem in wasmReader.Elements.entries) {
+                // HACK: This is not spec-compliant
+                if (elem.index != 0)
+                    continue;
+
+                if (elem.offset.Opcode != Opcodes.i32_const)
+                    throw new NotImplementedException($"Unexpected elements offset {elem.offset.Opcode}");
+
+                var startOffset = elem.offset.Body.U.i32;
+                var endOffset = startOffset + elem.elems.Length;
+                if (endOffset >= table.Length)
+                    Array.Resize(ref table, endOffset);
+
+                Array.Copy(elem.elems, 0, table, startOffset, elem.elems.Length);
+            }
+
+            // Scan the function pointer table and record function references inside it
+            foreach (var elem in table) {
+                if (elem < wasmReader.ImportedFunctionCount)
+                    continue;
+
+                var adjustedIndex = elem - wasmReader.ImportedFunctionCount;
+
+                FunctionInfo fi;
+                // FIXME: Abort if not found?
+                if (!data.Functions.TryGetValue(adjustedIndex, out fi))
+                    continue;
+
+                DependencyGraphNode fn;
+                if (!functionNodes.TryGetValue(fi, out fn))
+                    continue;
+
+                fn.TimesInTable += 1;
+            }
+
+            foreach (var export in wasmReader.Exports.entries) {
+                if (export.kind != external_kind.Function)
+                    continue;
+
+                if (export.index < wasmReader.ImportedFunctionCount)
+                    continue;
+
+                var adjustedIndex = export.index - wasmReader.ImportedFunctionCount;
+
+                FunctionInfo fi;
+                // FIXME: Abort if not found?
+                if (!data.Functions.TryGetValue(adjustedIndex, out fi))
+                    continue;
+
+                DependencyGraphNode fn;
+                if (!functionNodes.TryGetValue(fi, out fn))
+                    continue;
+
+                fn.TimesExported += 1;
+            }
+
+            // TODO: Record exports as well
 
             foreach (var kvp in functionNodes) {
                 FunctionInfo[] dd;
@@ -1027,6 +1116,12 @@ namespace WasmStrip {
                 case "stripout":
                     config.StripOutputPath = operand;
                     break;
+                case "stripreport":
+                case "stripreportout":
+                case "stripreportoutput":
+                case "stripreportpath":
+                    config.StripReportPath = operand;
+                    break;
                 case "verify":
                     config.VerifyOutput = true;
                     break;
@@ -1058,6 +1153,9 @@ namespace WasmStrip {
                 case "dumpsectionsto":
                 case "dumpsectionspath":
                     config.DumpSectionsPath = operand;
+                    break;
+                default:
+                    Console.Error.WriteLine($"Invalid argument: '{arg}'");
                     break;
             }
         }
