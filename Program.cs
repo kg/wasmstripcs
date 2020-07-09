@@ -30,6 +30,8 @@ namespace WasmStrip {
         public List<Regex> StripRetainRegexes = new List<Regex>();
         public List<Regex> StripRegexes = new List<Regex>();
 
+        public bool VerifyOutput = true;
+
         public string DumpSectionsPath;
         public List<string> DumpSectionRegexes = new List<string>();
     }
@@ -152,8 +154,14 @@ namespace WasmStrip {
                         DumpSections(config, wasmStream, wasmReader);
 
                     ClearLine("Stripping methods...");
-                    if (config.StripOutputPath != null)
+                    if (config.StripOutputPath != null) {
                         GenerateStrippedModule(config, wasmStream, wasmReader, functions);
+
+                        if (config.VerifyOutput) {
+                            ClearLine("Verifying stripped module...");
+                            VerifyModule(config.StripOutputPath);
+                        }
+                    }
 
                     ClearLine("OK.");
                     Console.WriteLine();
@@ -197,8 +205,16 @@ namespace WasmStrip {
         }
 
         private static StreamWindow GetSectionStream (BinaryReader stream, SectionHeader header, bool includeHeader) {
-            var startOffset = includeHeader ? header.StreamHeaderStart : header.StreamPayloadStart;
+            var startOffset = includeHeader ? header.StreamHeaderStart - 1 : header.StreamPayloadStart;
             return new StreamWindow(stream.BaseStream, startOffset, header.StreamPayloadEnd - startOffset);
+        }
+
+        private static void VerifyModule (string path) {
+            using (var s = File.OpenRead(path))
+            using (var br = new BinaryReader(s, Encoding.UTF8, true)) {
+                var wr = new WasmReader(br);
+                wr.Read();
+            }
         }
 
         private static void GenerateStrippedModule (
@@ -221,7 +237,7 @@ namespace WasmStrip {
                                 GenerateStrippedCodeSection(config, wasmStream, wasmReader, functions, sh, sectionScratchWriter);
                                 sectionScratchWriter.Flush();
 
-                                o.Write((byte)sh.id);
+                                o.Write((sbyte)sh.id);
                                 o.WriteLEB((uint)sectionScratch.Length);
                                 o.Flush();
 
@@ -260,7 +276,6 @@ namespace WasmStrip {
                     }
 
                     scratch.Flush();
-                    fb.Position = 0;
                     fb.CopyTo(scratchBuffer);
 
                     output.WriteLEB((uint)scratchBuffer.Position);
@@ -884,10 +899,12 @@ namespace WasmStrip {
                 arg = arg.Substring(0, equalsOffset);
             }
 
-            operand = operand.Replace("\\\"", "\"");
+            if (operand != null) {
+                operand = operand.Replace("\\\"", "\"");
 
-            if (operand.StartsWith('"') && operand.EndsWith('"'))
-                operand = operand.Substring(1, operand.Length - 2);
+                if (operand.StartsWith('"') && operand.EndsWith('"'))
+                    operand = operand.Substring(1, operand.Length - 2);
+            }
 
             arg = arg.Replace("-", "");
 
@@ -924,6 +941,12 @@ namespace WasmStrip {
                 case "stripoutpath":
                 case "stripout":
                     config.StripOutputPath = operand;
+                    break;
+                case "verify":
+                    config.VerifyOutput = true;
+                    break;
+                case "noverify":
+                    config.VerifyOutput = false;
                     break;
                 case "retain":
                 case "retainRegex":
