@@ -16,6 +16,8 @@ namespace WasmStrip {
         public string ModulePath;
 
         public string ReportPath;
+        public string GraphPath;
+
         public string DiffAgainst;
         public string DiffPath;
 
@@ -113,6 +115,8 @@ namespace WasmStrip {
                         var info = ProcessFunctionBody(wasmReader, fb, br, config);
                         functions[info.Index] = info;
                     };
+
+                    Console.Write("Reading module...                      ");
                     wasmReader.Read();
 
                     foreach (var kvp in wasmReader.FunctionNames) {
@@ -123,16 +127,36 @@ namespace WasmStrip {
                         functions[(uint)biasedIndex].Name = kvp.Value;
                     }
 
+                    Console.CursorLeft = 0;
+                    Console.Write("Analyzing module...                      ");
+
+                    AnalysisData data = null;
+                    if ((config.ReportPath != null) || (config.GraphPath != null))
+                        data = new AnalysisData(config, wasmStream, wasmReader, functions);
+
+                    Console.CursorLeft = 0;
+                    Console.Write("Generating output...                      ");
+
                     if (config.ReportPath != null)
-                        GenerateReport(config, wasmStream, wasmReader, functions);
+                        GenerateReport(config, wasmStream, wasmReader, data);
+
+                    if (config.GraphPath != null)
+                        ; // GenerateGraph(config, wasmStream, wasmReader, data);
+
+                    Console.CursorLeft = 0;
+                    Console.Write("Dumping raw data...                      ");
 
                     if (config.DumpSectionsPath != null)
                         DumpSections(config, wasmStream, wasmReader);
+
+                    Console.CursorLeft = 0;
+                    Console.WriteLine("OK.                                    ");
                 }
             } finally {
                 if (!execStarted) {
                     Console.Error.WriteLine("Usage: WasmStrip module.wasm [--option ...] [@response.rsp]");
                     Console.Error.WriteLine("  --report-out=filename.xml");
+                    Console.Error.WriteLine("  --graph-out=filename.dot");
                     Console.Error.WriteLine("  --diff-against=oldmodule.wasm --diff-out=filename.csv");
                     Console.Error.WriteLine("  --dump-sections[=regex] --dump-sections-to=outdir/");
                     /*
@@ -175,7 +199,23 @@ namespace WasmStrip {
             }
         }
 
-        private static void GenerateReport (Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
+        private class AnalysisData {
+            public readonly Dictionary<uint, FunctionInfo> Functions;
+            public readonly Dictionary<string, NamespaceInfo> Namespaces;
+            public readonly Dictionary<FunctionInfo, FunctionInfo[]> DirectDependencies;
+            public readonly DependencyGraphNode[] DependencyGraph;
+
+            public AnalysisData (Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
+                Functions = functions;
+                Namespaces = ComputeNamespaceSizes(this);
+                DirectDependencies = ComputeDirectDependencies(config, wasmStream, wasmReader, this);
+                DependencyGraph = ComputeDependencyGraph(config, this);
+            }
+        }
+
+        private static void GenerateReport (
+            Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data
+        ) {
             using (var output = new StreamWriter(config.ReportPath, false, Encoding.UTF8)) {
                 output.WriteLine(@"<?xml version=""1.0"" encoding=""UTF-8""?>
 <?mso-application progid=""Excel.Sheet""?>
@@ -200,10 +240,8 @@ namespace WasmStrip {
                     i++;
                 }
 
-                var namespaces = ComputeNamespaceSizes(functions);
-
                 i = 0;
-                foreach (var ns in namespaces.Values) {
+                foreach (var ns in data.Namespaces.Values) {
                     if (ns.FunctionCount < 2)
                         continue;
 
@@ -217,7 +255,7 @@ namespace WasmStrip {
                     i++;
                 }
 
-                foreach (var fn in functions.Values) {
+                foreach (var fn in data.Functions.Values) {
                     output.WriteLine("            <Row>");
                     WriteCell(output, "String", "function");
                     WriteCell(output, "Number", fn.Index.ToString());
@@ -235,10 +273,7 @@ namespace WasmStrip {
                     new[] { "Type", "Name", "In", "Out", "Size", "Out (Deep)", "Size (Deep)" }
                 );
 
-                var directDependencies = ComputeDirectDependencies(config, wasmStream, wasmReader, functions);
-                var dependencyGraph = ComputeDependencyGraph(config, functions, directDependencies);
-
-                foreach (var entry in dependencyGraph) {
+                foreach (var entry in data.DependencyGraph) {
                     output.WriteLine("            <Row>");
                     WriteCell(output, "String", entry.NamespaceName != null ? "namespace" : "function");
                     WriteCell(output, "String", entry.NamespaceName ?? (entry.Function.Name ?? $"#{entry.Function.Index}"));
@@ -291,12 +326,12 @@ namespace WasmStrip {
         }
 
         private static DependencyGraphNode[] ComputeDependencyGraph (
-            Config config, Dictionary<uint, FunctionInfo> functions, Dictionary<FunctionInfo, FunctionInfo[]> directDependencies
+            Config config, AnalysisData data
         ) {
             var namespaceNodes = new Dictionary<string, DependencyGraphNode>();
             var functionNodes = new Dictionary<FunctionInfo, DependencyGraphNode>();
 
-            foreach (var fn in functions.Values) {
+            foreach (var fn in data.Functions.Values) {
                 var fnode = new DependencyGraphNode {
                     Function = fn,
                     ShallowSize = fn.Body.body_size
@@ -321,7 +356,7 @@ namespace WasmStrip {
 
             foreach (var kvp in functionNodes) {
                 FunctionInfo[] dd;
-                if (!directDependencies.TryGetValue(kvp.Key, out dd))
+                if (!data.DirectDependencies.TryGetValue(kvp.Key, out dd))
                     continue;
 
                 kvp.Value.DirectDependencies = (from fi in dd select functionNodes[fi]).ToArray();
@@ -342,16 +377,16 @@ namespace WasmStrip {
             }
 
             foreach (var kvp in functionNodes)
-                ComputeDeepDependencies(config, functions, functionNodes, namespaceNodes, kvp.Value);
+                ComputeDeepDependencies(config, data, functionNodes, namespaceNodes, kvp.Value);
 
             foreach (var kvp in namespaceNodes)
-                ComputeDeepDependencies(config, functions, functionNodes, namespaceNodes, kvp.Value);
+                ComputeDeepDependencies(config, data, functionNodes, namespaceNodes, kvp.Value);
 
             return (from nsn in namespaceNodes.Values where nsn.ChildFunctions.Count > 1 select nsn).Concat(functionNodes.Values).ToArray();
         }
 
         private static void ComputeDeepDependencies (
-            Config config, Dictionary<uint, FunctionInfo> functions,
+            Config config, AnalysisData data,
             Dictionary<FunctionInfo, DependencyGraphNode> functionNodes, 
             Dictionary<string, DependencyGraphNode> namespaceNodes,
             DependencyGraphNode node
@@ -396,14 +431,14 @@ namespace WasmStrip {
         }
 
         private static Dictionary<FunctionInfo, FunctionInfo[]> ComputeDirectDependencies (
-            Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions
+            Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data
         ) {
             var result = new Dictionary<FunctionInfo, FunctionInfo[]>();
             var temp = new HashSet<FunctionInfo>();
 
-            foreach (var fn in functions.Values) {
+            foreach (var fn in data.Functions.Values) {
                 temp.Clear();
-                GatherDirectDependencies(config, wasmStream, wasmReader, functions, fn, temp);
+                GatherDirectDependencies(config, wasmStream, wasmReader, data, fn, temp);
 
                 if (temp.Count > 0)
                     result[fn] = temp.ToArray();
@@ -413,7 +448,7 @@ namespace WasmStrip {
         }
 
         private static void GatherDirectDependencies (
-            Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions, 
+            Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data, 
             FunctionInfo function, HashSet<FunctionInfo> dependencies
         ) {
             using (var subStream = new ModuleSaw.StreamWindow(
@@ -426,12 +461,12 @@ namespace WasmStrip {
                     if (!reader.TryReadExpressionBody(ref expr))
                         throw new Exception($"Failed to read body of {expr.Opcode}");
 
-                    GatherDirectDependencies(expr, wasmReader, functions, dependencies);
+                    GatherDirectDependencies(expr, wasmReader, data, dependencies);
                 }
             }
         }
 
-        private static void GatherDirectDependencies (Expression expr, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions, HashSet<FunctionInfo> dependencies) {
+        private static void GatherDirectDependencies (Expression expr, WasmReader wasmReader, AnalysisData data, HashSet<FunctionInfo> dependencies) {
             if (expr.Opcode == Opcodes.call) {
                 var index = expr.Body.U.u32;
                 if (index < wasmReader.ImportedFunctionCount) {
@@ -439,20 +474,20 @@ namespace WasmStrip {
                 } else {
                     index -= wasmReader.ImportedFunctionCount;
                     FunctionInfo callee;
-                    if (!functions.TryGetValue(index, out callee))
+                    if (!data.Functions.TryGetValue(index, out callee))
                         throw new Exception($"Invalid call target: {index}");
                     else
                         dependencies.Add(callee);
                 }
             } else if ((expr.Body.children != null) && (expr.Body.children.Count > 0)) {
                 foreach (var child in expr.Body.children)
-                    GatherDirectDependencies(child, wasmReader, functions, dependencies);
+                    GatherDirectDependencies(child, wasmReader, data, dependencies);
             }
         }
 
-        private static Dictionary<string, NamespaceInfo> ComputeNamespaceSizes (Dictionary<uint, FunctionInfo> functions) {
+        private static Dictionary<string, NamespaceInfo> ComputeNamespaceSizes (AnalysisData data) {
             var namespaces = new Dictionary<string, NamespaceInfo>();
-            foreach (var fn in functions.Values) {
+            foreach (var fn in data.Functions.Values) {
                 if (string.IsNullOrWhiteSpace(fn.Name))
                     continue;
 
@@ -655,6 +690,12 @@ namespace WasmStrip {
                 case "reportoutput":
                 case "reportpath":
                     config.ReportPath = operand;
+                    break;
+                case "graph":
+                case "graphout":
+                case "graphoutput":
+                case "graphpath":
+                    config.GraphPath = operand;
                     break;
                 case "diff":
                 case "diffagainst":
