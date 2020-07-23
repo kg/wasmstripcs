@@ -34,7 +34,10 @@ namespace WasmStrip {
         public bool VerifyOutput = true;
 
         public string DumpSectionsPath;
-        public List<string> DumpSectionRegexes = new List<string>();
+        public List<Regex> DumpSectionRegexes = new List<Regex>();
+
+        public string DumpFunctionsPath;
+        public List<Regex> DumpFunctionRegexes = new List<Regex>();
     }
 
     class NamespaceInfo {
@@ -136,16 +139,35 @@ namespace WasmStrip {
 
                     ClearLine("Generating reports...");
 
-                    if (config.ReportPath != null)
-                        GenerateReport(config, wasmStream, wasmReader, data, config.ReportPath);
+                    if (config.ReportPath != null) {
+                        try {
+                            GenerateReport(config, wasmStream, wasmReader, data, config.ReportPath);
+                        } catch (Exception exc) {
+                            ClearLine();
+                            Console.Error.WriteLine("Failed to generate report:{1}{0}", exc, Environment.NewLine);
+                            Console.WriteLine();
+                        }
+                    }
 
-                    if (config.GraphPath != null)
-                        GenerateGraph(config, wasmStream, wasmReader, data, config.GraphPath);
+                    if (config.GraphPath != null) {
+                        try {
+                            GenerateGraph(config, wasmStream, wasmReader, data, config.GraphPath);
+                        } catch (Exception exc) {
+                            ClearLine();
+                            Console.Error.WriteLine("Failed to generate graph:{1}{0}", exc, Environment.NewLine);
+                            Console.WriteLine();
+                        }
+                    }
 
-                    ClearLine("Dumping raw data...");
+                    ClearLine("Dumping sections...");
 
                     if (config.DumpSectionsPath != null)
                         DumpSections(config, wasmStream, wasmReader);
+
+                    ClearLine("Dumping functions...");
+
+                    if (config.DumpFunctionsPath != null)
+                        DumpFunctions(config, wasmStream, wasmReader, functions);
 
                     ClearLine("Stripping methods...");
                     if (config.StripOutputPath != null) {
@@ -187,6 +209,7 @@ namespace WasmStrip {
                     Console.Error.WriteLine("    --graph-filter=regex [...]");
                     Console.Error.WriteLine("  --diff-against=oldmodule.wasm --diff-out=filename.csv");
                     Console.Error.WriteLine("  --dump-sections[=regex] --dump-sections-to=outdir/");
+                    Console.Error.WriteLine("  --dump-functions=regex --dump-functions-to=outdir/");
                     Console.Error.WriteLine("  --strip-out=newmodule.wasm");
                     Console.Error.WriteLine("    --strip-section=regex [...]");
                     Console.Error.WriteLine("    --strip=regex [...]");
@@ -309,7 +332,6 @@ namespace WasmStrip {
             }
         }
 
-
         private static void EmitExpression (
             BinaryWriter writer, ref Expression e
         ) {
@@ -338,7 +360,7 @@ namespace WasmStrip {
                     writer.Write(e.Body.U.f32);
                     break;
                 case ExpressionBody.Types.memory:
-                    writer.WriteLEB(e.Body.U.memory.flags);
+                    writer.WriteLEB(e.Body.U.memory.alignment_exponent);
                     writer.WriteLEB(e.Body.U.memory.offset);
                     break;
                 case ExpressionBody.Types.type:
@@ -401,16 +423,223 @@ namespace WasmStrip {
                 var path = Path.Combine(config.DumpSectionsPath, id);
 
                 if (config.DumpSectionRegexes.Count > 0) {
-                    if (!config.DumpSectionRegexes.Any(re => Regex.IsMatch(id, re)))
+                    if (!config.DumpSectionRegexes.Any((re) => {
+                        if (sh.name != null)
+                            if (re.IsMatch(sh.name))
+                                return true;
+
+                        return re.IsMatch(sh.id.ToString());
+                    }))
                         continue;
                 }
 
-                using (var outStream = File.OpenWrite(path)) {
-                    outStream.SetLength(0);
-                    using (var sw = GetSectionStream(wasmStream, sh, false))
-                        sw.CopyTo(outStream);
+                try {
+                    using (var outStream = File.OpenWrite(path)) {
+                        outStream.SetLength(0);
+                        using (var sw = GetSectionStream(wasmStream, sh, false))
+                            sw.CopyTo(outStream);
+                    }
+                } catch (Exception exc) {
+                    Console.Error.WriteLine($"Failed to dump section {id}: {exc}");
                 }
             }
+        }
+
+        private static void DumpFunctions (Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
+            Directory.CreateDirectory(config.DumpFunctionsPath);
+
+            foreach (var body in wasmReader.Code.bodies) {
+                var fi = functions[body.Index];
+                var name = fi.Name ?? $"#{body.Index:00000}";
+
+                if (config.DumpFunctionRegexes.Count > 0) {
+                    if (!config.DumpFunctionRegexes.Any((re) => {
+                        return re.IsMatch(name);
+                    }))
+                        continue;
+                }
+
+                var path = Path.Combine(config.DumpFunctionsPath, name);
+
+                try {
+                    using (var outStream = File.OpenWrite(path)) {
+                        outStream.SetLength(0);
+
+                        using (var fb = GetFunctionBodyStream(body))
+                            fb.CopyTo(outStream);
+                    }
+                } catch (Exception exc) {
+                    Console.Error.WriteLine($"Failed to dump function {name}: {exc}");
+                }
+
+                path = Path.Combine(config.DumpFunctionsPath, name + ".dis");
+
+                try {
+                    using (var outStream = File.OpenWrite(path)) {
+                        outStream.SetLength(0);
+
+                        DisassembleFunctionBody(name, fi, outStream);
+                    }
+                } catch (Exception exc) {
+                    Console.Error.WriteLine($"Failed to dump function {name}: {exc}");
+                }
+            }
+        }
+
+        private class DisassembleListener : ExpressionReaderListener {
+            int Depth;
+
+            readonly Stack<long> StartOffsets = new Stack<long>();
+            readonly Stream Input;
+            readonly StreamWriter Output;
+
+            public DisassembleListener (Stream input, StreamWriter output) {
+                Input = input;
+                Output = output;
+                Depth = 0;
+            }
+
+            private void WriteIndented (string text) {
+                Output.Write("{0}{1}", new string(' ', Depth), text);
+            }
+
+            private void WriteIndented (string format, params object[] args) {
+                WriteIndented(string.Format(format, args));
+            }
+
+            public void BeginBody (ref Expression expression, bool readingChildNodes) {
+                if (readingChildNodes) {
+                    WriteHeader(ref expression);
+                    Output.WriteLine("(");
+                }
+            }
+
+            public void BeginHeader () {
+                StartOffsets.Push(Input.Position);
+            }
+
+            private string RangeToBytes (long startOffset, long endOffset) {
+                var sb = new StringBuilder();
+                var position = Input.Position;
+                try {
+                    Input.Seek(startOffset, SeekOrigin.Begin);
+                    var count = (int)(endOffset - startOffset);
+                    var bytes = new byte[count];
+                    Input.Read(bytes, 0, count);
+                    for (int i = 0; i < count; i++) {
+                        sb.Append(bytes[i].ToString("X2"));
+                        if (i < count - 1)
+                            sb.Append(' ');
+                    }
+                    return sb.ToString();
+                } finally {
+                    Input.Seek(position, SeekOrigin.Begin);
+                }
+            }
+
+            private void WriteHeader (ref Expression expression) {
+                Depth -= 1;
+
+                var startOffset = StartOffsets.Pop();
+                var endOffset = Input.Position;
+
+                var disassembly = RangeToBytes(startOffset, endOffset);
+                WriteIndented(disassembly);
+                Output.WriteLine();
+
+                WriteIndented(expression.Opcode.ToString() + " ");
+
+                if (expression.Body.Type == ExpressionBody.Types.type)
+                    Output.Write($"{expression.Body.U.type} ");
+
+                Depth += 1;
+            }
+
+            public void EndBody (ref Expression expression, bool readChildNodes, bool successful) {
+                if (!readChildNodes)
+                    WriteHeader(ref expression);
+
+                if (!successful) {
+                    Output.Write("<error>");
+                    Depth -= 1;
+                } else if (readChildNodes) {
+                    Depth -= 1;
+                    WriteIndented(")");
+                    Output.WriteLine();
+                } else {
+                    switch (expression.Body.Type) {
+                        case ExpressionBody.Types.u32:
+                        case ExpressionBody.Types.u1:
+                            Output.WriteLine(expression.Body.U.u32);
+                            break;
+                        case ExpressionBody.Types.i64:
+                            Output.WriteLine(expression.Body.U.i64);
+                            break;
+                        case ExpressionBody.Types.i32:
+                            Output.WriteLine(expression.Body.U.i32);
+                            break;
+                        case ExpressionBody.Types.f64:
+                            Output.WriteLine(expression.Body.U.f64);
+                            break;
+                        case ExpressionBody.Types.f32:
+                            Output.WriteLine(expression.Body.U.f32);
+                            break;
+                        case ExpressionBody.Types.memory:
+                            if (expression.Body.U.memory.alignment_exponent != 0)
+                                Output.WriteLine($"[{1 << (int)expression.Body.U.memory.alignment_exponent}] +{expression.Body.U.memory.offset}");
+                            else
+                                Output.WriteLine($"+{expression.Body.U.memory.offset}");
+                            break;
+                        case ExpressionBody.Types.type:
+                        case ExpressionBody.Types.br_table:
+                            break;
+                        default:
+                            Output.WriteLine();
+                            break;
+                    }
+                    Depth -= 1;
+                }
+            }
+
+            public void EndHeader (ref Expression expression, bool successful) {
+                if (!successful) {
+                    StartOffsets.Pop();
+                    WriteIndented("<error>" + Environment.NewLine);
+                } else {
+                    Depth += 1;
+                }
+            }
+        }
+
+        private static void DisassembleFunctionBody (string name, FunctionInfo function, FileStream outStream) {
+            var body = function.Body;
+
+            var outWriter = new StreamWriter(outStream, Encoding.UTF8);
+            outWriter.WriteLine($"{name} -> {function.Type.return_type}");
+            if (body.locals.Length > 0) {
+                outWriter.WriteLine($"{body.locals.Sum(l => l.count)} local(s)");
+                foreach (var l in body.locals)
+                    outWriter.WriteLine($"  {l.type} x{l.count}");
+            }
+
+            outWriter.WriteLine();
+
+            using (var fb = GetFunctionBodyStream(body)) {
+                var fbr = new BinaryReader(fb, Encoding.UTF8, true);
+                var er = new ExpressionReader(fbr);
+
+                var listener = new DisassembleListener(fb, outWriter);
+
+                while (true) {
+                    Expression expr;
+                    if (!er.TryReadExpression(out expr, listener))
+                        break;
+                    if (!er.TryReadExpressionBody(ref expr, listener))
+                        break;
+                }
+            }
+
+            outWriter.Flush();
         }
 
         private class AnalysisData {
@@ -1144,15 +1373,27 @@ namespace WasmStrip {
                     break;
                 case "dumpsections":
                     if (string.IsNullOrWhiteSpace(operand))
-                        config.DumpSectionRegexes.Add(".*");
+                        config.DumpSectionRegexes.Add(new Regex(".*"));
                     else
-                        config.DumpSectionRegexes.Add(operand);
+                        config.DumpSectionRegexes.Add(new Regex(operand));
                     break;
                 case "dumpsectionsout":
                 case "dumpsectionsoutput":
                 case "dumpsectionsto":
                 case "dumpsectionspath":
                     config.DumpSectionsPath = operand;
+                    break;
+                case "dumpfunctions":
+                    if (string.IsNullOrWhiteSpace(operand))
+                        config.DumpFunctionRegexes.Add(new Regex(".*"));
+                    else
+                        config.DumpFunctionRegexes.Add(new Regex(operand));
+                    break;
+                case "dumpfunctionsout":
+                case "dumpfunctionsoutput":
+                case "dumpfunctionsto":
+                case "dumpfunctionspath":
+                    config.DumpFunctionsPath = operand;
                     break;
                 default:
                     Console.Error.WriteLine($"Invalid argument: '{arg}'");
