@@ -459,7 +459,9 @@ namespace WasmStrip {
                         continue;
                 }
 
-                var path = Path.Combine(config.DumpFunctionsPath, name);
+                var fileName = name.Replace(":", "_").Replace("\\", "_").Replace("/", "_").Replace("<", "(").Replace(">", ")").Replace("?", "_").Replace("*", "_");
+
+                var path = Path.Combine(config.DumpFunctionsPath, fileName);
 
                 try {
                     using (var outStream = File.OpenWrite(path)) {
@@ -472,13 +474,13 @@ namespace WasmStrip {
                     Console.Error.WriteLine($"Failed to dump function {name}: {exc}");
                 }
 
-                path = Path.Combine(config.DumpFunctionsPath, name + ".dis");
+                path = Path.Combine(config.DumpFunctionsPath, fileName + ".dis");
 
                 try {
                     using (var outStream = File.OpenWrite(path)) {
                         outStream.SetLength(0);
 
-                        DisassembleFunctionBody(name, fi, outStream);
+                        DisassembleFunctionBody(name, fi, outStream, functions, wasmReader.ImportedFunctionCount);
                     }
                 } catch (Exception exc) {
                     Console.Error.WriteLine($"Failed to dump function {name}: {exc}");
@@ -487,28 +489,47 @@ namespace WasmStrip {
         }
 
         private class DisassembleListener : ExpressionReaderListener {
+            const int BytesWidth = 16;
+
             int Depth;
 
+            readonly uint FunctionIndexOffset;
+            readonly FunctionInfo Function;
+            readonly Dictionary<uint, FunctionInfo> Functions;
             readonly Stack<long> StartOffsets = new Stack<long>();
             readonly Stream Input;
             readonly StreamWriter Output;
 
-            public DisassembleListener (Stream input, StreamWriter output) {
+            public DisassembleListener (Stream input, StreamWriter output, FunctionInfo function, Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset) {
+                FunctionIndexOffset = functionIndexOffset;
+                Function = function;
+                Functions = functions;
                 Input = input;
                 Output = output;
                 Depth = 0;
             }
 
-            private void WriteIndented (string text) {
-                Output.Write("{0}{1}", new string(' ', Depth), text);
+            private string GetIndent (int offset, int depth) {
+                const int threshold = 24;
+                if (depth < threshold) {
+                    return new string(' ', Depth + offset);
+                } else {
+                    var counter = $"{depth} > ";
+                    return new string(' ', threshold + offset - counter.Length) + counter;
+                }
             }
 
-            private void WriteIndented (string format, params object[] args) {
-                WriteIndented(string.Format(format, args));
+            private void WriteIndented (int offset, string text) {
+                Output.Write("{0}{1}", GetIndent(offset, Depth), text);
+            }
+
+            private void WriteIndented (int offset, string format, params object[] args) {
+                WriteIndented(offset, string.Format(format, args));
             }
 
             public void BeginBody (ref Expression expression, bool readingChildNodes) {
                 if (readingChildNodes) {
+                    Output.WriteLine();
                     WriteHeader(ref expression);
                     Output.WriteLine("(");
                 }
@@ -526,11 +547,21 @@ namespace WasmStrip {
                     var count = (int)(endOffset - startOffset);
                     var bytes = new byte[count];
                     Input.Read(bytes, 0, count);
+
+                    int lineOffset = 0;
                     for (int i = 0; i < count; i++) {
+                        if (sb.Length - lineOffset >= BytesWidth) {
+                            sb.AppendLine(" ...");
+                            lineOffset = sb.Length;
+                        }
+
                         sb.Append(bytes[i].ToString("X2"));
-                        if (i < count - 1)
-                            sb.Append(' ');
                     }
+
+                    // HACK
+                    while (sb.Length - lineOffset < BytesWidth)
+                        sb.Append(' ');
+
                     return sb.ToString();
                 } finally {
                     Input.Seek(position, SeekOrigin.Begin);
@@ -544,15 +575,30 @@ namespace WasmStrip {
                 var endOffset = Input.Position;
 
                 var disassembly = RangeToBytes(startOffset, endOffset);
-                WriteIndented(disassembly);
-                Output.WriteLine();
+                Output.Write(disassembly);
 
-                WriteIndented(expression.Opcode.ToString() + " ");
+                WriteIndented(0, expression.Opcode.ToString() + " ");
 
                 if (expression.Body.Type == ExpressionBody.Types.type)
                     Output.Write($"{expression.Body.U.type} ");
 
                 Depth += 1;
+            }
+
+            private Wasm.Model.LanguageTypes GetTypeOfLocal (uint index) {
+                if (index < Function.Type.param_types.Length)
+                    return Function.Type.param_types[index];
+
+                index -= (uint)Function.Type.param_types.Length;
+
+                foreach (var l in Function.Body.locals) {
+                    if (index < l.count)
+                        return l.type;
+
+                    index -= l.count;
+                }
+
+                return LanguageTypes.none;
             }
 
             public void EndBody (ref Expression expression, bool readChildNodes, bool successful) {
@@ -564,39 +610,68 @@ namespace WasmStrip {
                     Depth -= 1;
                 } else if (readChildNodes) {
                     Depth -= 1;
-                    WriteIndented(")");
+                    WriteIndented(16, ")");
+                    Output.WriteLine();
                     Output.WriteLine();
                 } else {
-                    switch (expression.Body.Type) {
-                        case ExpressionBody.Types.u32:
-                        case ExpressionBody.Types.u1:
-                            Output.WriteLine(expression.Body.U.u32);
+                    switch (expression.Opcode) {
+                        case Opcodes.call:
+                            var func = Functions[expression.Body.U.u32 - FunctionIndexOffset];
+                            Output.Write((func.Name + " ") ?? $"#{expression.Body.U.u32} ");
+                            Output.WriteLine(GetSignatureForType(func.Type));
                             break;
-                        case ExpressionBody.Types.i64:
-                            Output.WriteLine(expression.Body.U.i64);
+
+                        case Opcodes.get_local:
+                        case Opcodes.set_local:
+                        case Opcodes.tee_local:
+                            Output.WriteLine($"{GetTypeOfLocal(expression.Body.U.u32)} #{expression.Body.U.u32}");
                             break;
-                        case ExpressionBody.Types.i32:
-                            Output.WriteLine(expression.Body.U.i32);
-                            break;
-                        case ExpressionBody.Types.f64:
-                            Output.WriteLine(expression.Body.U.f64);
-                            break;
-                        case ExpressionBody.Types.f32:
-                            Output.WriteLine(expression.Body.U.f32);
-                            break;
-                        case ExpressionBody.Types.memory:
-                            if (expression.Body.U.memory.alignment_exponent != 0)
-                                Output.WriteLine($"[{1 << (int)expression.Body.U.memory.alignment_exponent}] +{expression.Body.U.memory.offset}");
-                            else
-                                Output.WriteLine($"+{expression.Body.U.memory.offset}");
-                            break;
-                        case ExpressionBody.Types.type:
-                        case ExpressionBody.Types.br_table:
-                            break;
+
                         default:
-                            Output.WriteLine();
+                            switch (expression.Body.Type) {
+                                case ExpressionBody.Types.u1:
+                                    Output.WriteLine(expression.Body.U.u32);
+                                    break;
+                                case ExpressionBody.Types.u32:
+                                    if (expression.Body.U.u32 >= 10)
+                                        Output.WriteLine($"0x{expression.Body.U.u32:X8} {expression.Body.U.u32}");
+                                    else
+                                        Output.WriteLine(expression.Body.U.u32);
+                                    break;
+                                case ExpressionBody.Types.i64:
+                                    Output.WriteLine($"0x{expression.Body.U.i64:X16} {expression.Body.U.i64}");
+                                    break;
+                                case ExpressionBody.Types.i32:
+                                    if (expression.Body.U.u32 >= 10)
+                                        Output.WriteLine($"0x{expression.Body.U.u32:X8} {expression.Body.U.i32}");
+                                    else
+                                        Output.WriteLine(expression.Body.U.i32);
+                                    break;
+                                case ExpressionBody.Types.f64:
+                                    Output.WriteLine($"0x{expression.Body.U.u32:X16} {expression.Body.U.f64}");
+                                    break;
+                                case ExpressionBody.Types.f32:
+                                    Output.WriteLine($"0x{expression.Body.U.u32:X8} {expression.Body.U.f32}");
+                                    break;
+                                case ExpressionBody.Types.memory:
+                                    if (expression.Body.U.memory.alignment_exponent != 0)
+                                        Output.WriteLine($"[{1 << (int)expression.Body.U.memory.alignment_exponent}] +{expression.Body.U.memory.offset}");
+                                    else
+                                        Output.WriteLine($"+{expression.Body.U.memory.offset}");
+                                    break;
+                                case ExpressionBody.Types.type:
+                                    break;
+                                case ExpressionBody.Types.br_table:
+                                    Output.WriteLine("...");
+                                    break;
+                                default:
+                                    Output.WriteLine();
+                                    break;
+                            }
+
                             break;
                     }
+
                     Depth -= 1;
                 }
             }
@@ -604,18 +679,21 @@ namespace WasmStrip {
             public void EndHeader (ref Expression expression, bool successful) {
                 if (!successful) {
                     StartOffsets.Pop();
-                    WriteIndented("<error>" + Environment.NewLine);
+                    if (Depth == 0)
+                        WriteIndented(0, "<eof>" + Environment.NewLine);
+                    else
+                        WriteIndented(Depth, "<error>" + Environment.NewLine);
                 } else {
                     Depth += 1;
                 }
             }
         }
 
-        private static void DisassembleFunctionBody (string name, FunctionInfo function, FileStream outStream) {
+        private static void DisassembleFunctionBody (string name, FunctionInfo function, FileStream outStream, Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset) {
             var body = function.Body;
 
             var outWriter = new StreamWriter(outStream, Encoding.UTF8);
-            outWriter.WriteLine($"{name} -> {function.Type.return_type}");
+            outWriter.WriteLine($"{name} -> {function.Type.return_type} ({function.Body.body_size} byte(s))");
             if (body.locals.Length > 0) {
                 outWriter.WriteLine($"{body.locals.Sum(l => l.count)} local(s)");
                 foreach (var l in body.locals)
@@ -628,7 +706,7 @@ namespace WasmStrip {
                 var fbr = new BinaryReader(fb, Encoding.UTF8, true);
                 var er = new ExpressionReader(fbr);
 
-                var listener = new DisassembleListener(fb, outWriter);
+                var listener = new DisassembleListener(fb, outWriter, function, functions, functionIndexOffset);
 
                 while (true) {
                     Expression expr;
@@ -647,6 +725,7 @@ namespace WasmStrip {
             public readonly Dictionary<string, NamespaceInfo> Namespaces;
             public readonly Dictionary<FunctionInfo, FunctionInfo[]> DirectDependencies;
             public readonly DependencyGraphNode[] DependencyGraph;
+            public readonly Dictionary<string, object> RawData;
 
             public AnalysisData (Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
                 Functions = functions;
@@ -655,6 +734,114 @@ namespace WasmStrip {
                 DirectDependencies = ComputeDirectDependencies(config, wasmStream, wasmReader, this);
                 Console.Write(".");
                 DependencyGraph = ComputeDependencyGraph(config, wasmStream, wasmReader, this);
+                Console.Write(".");
+                RawData = ComputeRawData(config, wasmStream, wasmReader, this);
+            }
+
+            
+            private class RawDataListener : ExpressionReaderListener {
+                public int GetLocalRuns, SetLocalRuns, DupCandidates, MaxRunSize, RunCount, AverageRunLengthSum;
+                public int SimpleI32Memops;
+                int CurrentRunSize;
+                Expression PreviousExpression = default(Expression);
+
+                public RawDataListener () {
+                }
+
+                public void BeginBody (ref Expression expression, bool readingChildNodes) {
+                }
+
+                public void BeginHeader () {
+                }
+
+                private void WriteHeader (ref Expression expression) {
+                }
+
+                private void ResetRun () {
+                    if (CurrentRunSize != 0) {
+                        AverageRunLengthSum += CurrentRunSize;
+                        RunCount++;
+                    }
+                    CurrentRunSize = 0;
+                }
+
+                public void EndBody (ref Expression expression, bool readChildNodes, bool successful) {
+                    var isLoad = (expression.Opcode >= OpcodesInfo.FirstLoad) && (expression.Opcode <= OpcodesInfo.LastLoad);
+                    var isStore = (expression.Opcode >= OpcodesInfo.FirstStore) && (expression.Opcode <= OpcodesInfo.LastStore);
+
+                    if (expression.Opcode == PreviousExpression.Opcode) {
+                        if (expression.Opcode == Opcodes.get_local) {
+                            GetLocalRuns++;
+                            CurrentRunSize++;
+                        } else if (expression.Opcode == Opcodes.set_local) {
+                            SetLocalRuns++;
+                            CurrentRunSize++;
+                        } else {
+                            ResetRun();
+                        }
+                    } else if (
+                        (
+                            // FIXME: Inaccurate
+                            (expression.Opcode == Opcodes.get_local) ||
+                            (expression.Opcode == Opcodes.get_global)
+                        ) &&
+                        (
+                            (PreviousExpression.Opcode == Opcodes.set_local) ||
+                            (PreviousExpression.Opcode == Opcodes.tee_local) ||
+                            (PreviousExpression.Opcode == Opcodes.set_global)
+                        )
+                    ) {
+                        ResetRun();
+                        if (expression.Body.U.i32 == PreviousExpression.Body.U.i32)
+                            DupCandidates++;
+                    } else if (
+                        (
+                            (expression.Opcode == Opcodes.i32_load) ||
+                            (expression.Opcode == Opcodes.i32_store)
+                        ) &&
+                        (
+                            (PreviousExpression.Opcode == Opcodes.get_local) ||
+                            (PreviousExpression.Opcode == Opcodes.tee_local) ||
+                            (PreviousExpression.Opcode == Opcodes.get_global)
+                        )
+                    ) {
+                        ResetRun();
+                        SimpleI32Memops++;
+                    } else {
+                        ResetRun();
+                    }
+
+                    MaxRunSize = Math.Max(MaxRunSize, CurrentRunSize);
+                    PreviousExpression = expression;
+                }
+
+                public void EndHeader (ref Expression expression, bool successful) {
+                }
+            }
+
+            private Dictionary<string, object> ComputeRawData (Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData analysisData) {
+                var listener = new RawDataListener();
+
+                foreach (var function in analysisData.Functions.Values) {
+                    using (var subStream = GetFunctionBodyStream(function.Body)) {
+                        var reader = new ExpressionReader(new BinaryReader(subStream));
+
+                        Expression expr;
+                        while (reader.TryReadExpression(out expr, listener)) {
+                            if (!reader.TryReadExpressionBody(ref expr, listener))
+                                throw new Exception($"Failed to read body of {expr.Opcode}");
+                        }
+                    }
+                }
+
+                return new Dictionary<string, object> {
+                    {"GetLocalRuns", listener.GetLocalRuns },
+                    {"SetLocalRuns", listener.SetLocalRuns },
+                    {"DupCandidates", listener.DupCandidates },
+                    {"MaxRunSize", listener.MaxRunSize },
+                    {"AverageRunLength", listener.AverageRunLengthSum / (double)listener.RunCount },
+                    {"SimpleI32Memops", listener.SimpleI32Memops }
+                };
             }
         }
 
@@ -825,6 +1012,21 @@ namespace WasmStrip {
                 }
 
                 WriteSheetFooter(output, 10);
+
+                WriteSheetHeader(
+                    output, "Raw Data",
+                    new[] { 500, 100 },
+                    new[] { "Name", "Value" }
+                );
+
+                foreach (var kvp in data.RawData) {
+                    output.WriteLine("            <Row>");
+                    WriteCell(output, "String", kvp.Key.ToString());
+                    WriteCell(output, kvp.Value is string ? "String" : "Number", kvp.Value.ToString());
+                    output.WriteLine("            </Row>");
+                }
+
+                WriteSheetFooter(output, 2);
 
                 output.WriteLine("</Workbook>");
             }
