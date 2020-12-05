@@ -601,6 +601,15 @@ namespace WasmStrip {
                 return LanguageTypes.none;
             }
 
+            private string GetNameOfLocal (uint index) {
+                if (index < Function.Type.param_types.Length) {
+                    return $"arg{index}";
+                }
+
+                index -= (uint)Function.Type.param_types.Length;
+                return $"local{index}";
+            }
+
             public void EndBody (ref Expression expression, bool readChildNodes, bool successful) {
                 if (!readChildNodes)
                     WriteHeader(ref expression);
@@ -624,7 +633,7 @@ namespace WasmStrip {
                         case Opcodes.get_local:
                         case Opcodes.set_local:
                         case Opcodes.tee_local:
-                            Output.WriteLine($"{GetTypeOfLocal(expression.Body.U.u32)} #{expression.Body.U.u32}");
+                            Output.WriteLine($"{GetTypeOfLocal(expression.Body.U.u32)} {GetNameOfLocal(expression.Body.U.u32)}");
                             break;
 
                         default:
