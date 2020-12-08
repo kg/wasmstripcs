@@ -28,15 +28,22 @@ namespace WasmStrip {
             Input = input;
         }
 
+        private uint? _ImportedFunctionCount,
+            _ExportedFunctionCount;
+
         public uint ImportedFunctionCount {
             get {
-                return (uint)Imports.entries.Count(e => e.kind == external_kind.Function);
+                if (!_ImportedFunctionCount.HasValue)
+                    _ImportedFunctionCount = (uint)Imports.entries.Count(e => e.kind == external_kind.Function);
+                return _ImportedFunctionCount.Value;
             }
         }
 
         public uint ExportedFunctionCount {
             get {
-                return (uint)Exports.entries.Count(e => e.kind == external_kind.Function);
+                if (!_ExportedFunctionCount.HasValue)
+                    _ExportedFunctionCount = (uint)Exports.entries.Count(e => e.kind == external_kind.Function);
+                return _ExportedFunctionCount.Value;
             }
         }
 

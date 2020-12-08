@@ -13,6 +13,16 @@ using Wasm.Model;
 using ModuleSaw;
 
 namespace WasmStrip {
+    class ReferenceComparer<T> : IEqualityComparer<T> {
+        bool IEqualityComparer<T>.Equals (T x, T y) {
+            return object.ReferenceEquals(x, y);
+        }
+
+        int IEqualityComparer<T>.GetHashCode (T obj) {
+            return obj.GetHashCode();
+        }
+    }
+
     class Config {
         public string ModulePath;
 
@@ -41,14 +51,28 @@ namespace WasmStrip {
     }
 
     class NamespaceInfo {
+        public static readonly ReferenceComparer<NamespaceInfo> Comparer = new ReferenceComparer<NamespaceInfo>();
+
         public int Index;
         public string Name;
         public uint FunctionCount;
         public uint SizeBytes;
-        public HashSet<NamespaceInfo> ChildNamespaces = new HashSet<NamespaceInfo>();
+        public HashSet<NamespaceInfo> ChildNamespaces = new HashSet<NamespaceInfo>(Comparer);
+    }
+
+    class FunctionInfoComparer : IEqualityComparer<FunctionInfo> {
+        public bool Equals (FunctionInfo x, FunctionInfo y) {
+            return (x.Index == y.Index);
+        }
+
+        public int GetHashCode (FunctionInfo obj) {
+            unchecked { return (int)obj.Index; }
+        }
     }
 
     class FunctionInfo {
+        public static readonly FunctionInfoComparer Comparer = new FunctionInfoComparer();
+
         public uint Index;
         public uint TypeIndex;
         public func_type Type;
@@ -131,11 +155,19 @@ namespace WasmStrip {
 
                     AssignFunctionNames(functions, wasmReader);
 
+                    ClearLine("Dumping sections...");
+
+                    if (config.DumpSectionsPath != null)
+                        DumpSections(config, wasmStream, wasmReader);
+
                     ClearLine("Analyzing module.");
 
                     AnalysisData data = null;
-                    if ((config.ReportPath != null) || (config.GraphPath != null))
-                        data = new AnalysisData(config, wasmStream, wasmReader, functions);
+                    if ((config.ReportPath != null) || (config.GraphPath != null)) {
+                        var functionArray = new FunctionInfo[functions.Count];
+                        functions.Values.CopyTo(functionArray, 0);
+                        data = new AnalysisData(config, wasmStream, wasmReader, functionArray);
+                    }
 
                     ClearLine("Generating reports...");
 
@@ -158,11 +190,6 @@ namespace WasmStrip {
                             Console.WriteLine();
                         }
                     }
-
-                    ClearLine("Dumping sections...");
-
-                    if (config.DumpSectionsPath != null)
-                        DumpSections(config, wasmStream, wasmReader);
 
                     ClearLine("Dumping functions...");
 
@@ -190,7 +217,9 @@ namespace WasmStrip {
 
                                 if (config.StripReportPath != null) {
                                     ClearLine("Analyzing stripped module.");
-                                    var newData = new AnalysisData(config, resultReader, resultWasmReader, resultFunctions);
+                                    var resultArray = new FunctionInfo[resultFunctions.Count];
+                                    resultFunctions.Values.CopyTo(resultArray, 0);
+                                    var newData = new AnalysisData(config, resultReader, resultWasmReader, resultArray);
 
                                     GenerateReport(config, resultReader, resultWasmReader, newData, config.StripReportPath);
                                 }
@@ -730,13 +759,13 @@ namespace WasmStrip {
         }
 
         private class AnalysisData {
-            public readonly Dictionary<uint, FunctionInfo> Functions;
+            public readonly FunctionInfo[] Functions;
             public readonly Dictionary<string, NamespaceInfo> Namespaces;
             public readonly Dictionary<FunctionInfo, FunctionInfo[]> DirectDependencies;
             public readonly DependencyGraphNode[] DependencyGraph;
             public readonly Dictionary<string, object> RawData;
 
-            public AnalysisData (Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
+            public AnalysisData (Config config, BinaryReader wasmStream, WasmReader wasmReader, FunctionInfo[] functions) {
                 Functions = functions;
                 Namespaces = ComputeNamespaceSizes(this);
                 Console.Write(".");
@@ -747,6 +776,13 @@ namespace WasmStrip {
                 RawData = ComputeRawData(config, wasmStream, wasmReader, this);
             }
 
+            public bool TryGetFunction (uint index, out FunctionInfo result) {
+                result = default(FunctionInfo);
+                if ((index < 0) || (index >= Functions.Length))
+                    return false;
+                result = Functions[index];
+                return true;
+            }
             
             private class RawDataListener : ExpressionReaderListener {
                 public int GetLocalRuns, SetLocalRuns, DupCandidates, MaxRunSize, RunCount, AverageRunLengthSum;
@@ -831,7 +867,7 @@ namespace WasmStrip {
             private Dictionary<string, object> ComputeRawData (Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData analysisData) {
                 var listener = new RawDataListener();
 
-                foreach (var function in analysisData.Functions.Values) {
+                foreach (var function in analysisData.Functions) {
                     using (var subStream = GetFunctionBodyStream(function.Body)) {
                         var reader = new ExpressionReader(new BinaryReader(subStream));
 
@@ -867,7 +903,7 @@ namespace WasmStrip {
 
                 var namespaceDependencies = data.DependencyGraph.Where(dgn => dgn.NamespaceName != null).ToLookup(dgn => dgn.NamespaceName);
 
-                var referencedNamespaces = new HashSet<NamespaceInfo>();
+                var referencedNamespaces = new HashSet<NamespaceInfo>(NamespaceInfo.Comparer);
                 foreach (var kvp in data.Namespaces) {
                     if ((config.GraphRegexes.Count > 0) && !config.GraphRegexes.Any(gr => gr.IsMatch(kvp.Key)))
                         continue;
@@ -886,7 +922,7 @@ namespace WasmStrip {
                     }
                 }
 
-                var namespaces = new HashSet<NamespaceInfo>();
+                var namespaces = new HashSet<NamespaceInfo>(NamespaceInfo.Comparer);
                 foreach (var kvp in data.Namespaces) {
                     namespaces.Add(kvp.Value);
 
@@ -898,7 +934,7 @@ namespace WasmStrip {
                     }
                 }
 
-                var labelsNeeded = new HashSet<NamespaceInfo>();
+                var labelsNeeded = new HashSet<NamespaceInfo>(NamespaceInfo.Comparer);
 
                 foreach (var nsi in namespaces) {
                     if (!referencedNamespaces.Contains(nsi)) {
@@ -987,7 +1023,7 @@ namespace WasmStrip {
                     output.WriteLine("            </Row>");
                 }
 
-                foreach (var fn in data.Functions.Values) {
+                foreach (var fn in data.Functions) {
                     output.WriteLine("            <Row>");
                     WriteCell(output, "String", "function");
                     WriteCell(output, "Number", fn.Index.ToString());
@@ -1042,6 +1078,8 @@ namespace WasmStrip {
         }
 
         class DependencyGraphNode {
+            public static readonly ReferenceComparer<DependencyGraphNode> Comparer = new ReferenceComparer<DependencyGraphNode>();
+
             public FunctionInfo Function;
             public string NamespaceName;
 
@@ -1065,7 +1103,7 @@ namespace WasmStrip {
                     if (Function != null)
                         return DirectDependencies?.Length ?? 0;
 
-                    var hs = new HashSet<DependencyGraphNode>();
+                    var hs = new HashSet<DependencyGraphNode>(DependencyGraphNode.Comparer);
                     foreach (var cf in ChildFunctions) {
                         if (cf.DirectDependencies == null)
                             continue;
@@ -1081,10 +1119,10 @@ namespace WasmStrip {
         private static DependencyGraphNode[] ComputeDependencyGraph (
             Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data
         ) {
-            var namespaceNodes = new Dictionary<string, DependencyGraphNode>();
-            var functionNodes = new Dictionary<FunctionInfo, DependencyGraphNode>();
+            var namespaceNodes = new Dictionary<string, DependencyGraphNode>(data.Functions.Length / 10, StringComparer.Ordinal);
+            var functionNodes = new DependencyGraphNode[data.Functions.Length];
 
-            foreach (var fn in data.Functions.Values) {
+            foreach (var fn in data.Functions) {
                 var fnode = new DependencyGraphNode {
                     Function = fn,
                     ShallowSize = fn.Body.body_size
@@ -1096,8 +1134,8 @@ namespace WasmStrip {
                     if (!namespaceNodes.TryGetValue(namespaceName, out namespaceNode))
                         namespaceNode = namespaceNodes[namespaceName] = new DependencyGraphNode {
                             NamespaceName = namespaceName,
-                            ChildFunctions = new HashSet<DependencyGraphNode>(),
-                            ReferencedNamespaces = new HashSet<DependencyGraphNode>()
+                            ChildFunctions = new HashSet<DependencyGraphNode>(DependencyGraphNode.Comparer),
+                            ReferencedNamespaces = new HashSet<DependencyGraphNode>(DependencyGraphNode.Comparer)
                         };
 
                     namespaceNode.ShallowSize += fnode.ShallowSize;
@@ -1105,7 +1143,7 @@ namespace WasmStrip {
                     fnode.ParentNamespace = namespaceNode;
                 }
 
-                functionNodes[fn] = fnode;
+                functionNodes[fn.Index] = fnode;
             }
 
             if ((wasmReader.Tables.entries?.Length ?? 0) > 0)
@@ -1137,13 +1175,10 @@ namespace WasmStrip {
 
                 FunctionInfo fi;
                 // FIXME: Abort if not found?
-                if (!data.Functions.TryGetValue(adjustedIndex, out fi))
+                if (!data.TryGetFunction(adjustedIndex, out fi))
                     continue;
 
-                DependencyGraphNode fn;
-                if (!functionNodes.TryGetValue(fi, out fn))
-                    continue;
-
+                var fn = functionNodes[fi.Index];
                 fn.TimesInTable += 1;
             }
 
@@ -1158,36 +1193,35 @@ namespace WasmStrip {
 
                 FunctionInfo fi;
                 // FIXME: Abort if not found?
-                if (!data.Functions.TryGetValue(adjustedIndex, out fi))
+                if (!data.TryGetFunction(adjustedIndex, out fi))
                     continue;
 
-                DependencyGraphNode fn;
-                if (!functionNodes.TryGetValue(fi, out fn))
-                    continue;
-
+                var fn = functionNodes[fi.Index];
                 fn.TimesExported += 1;
             }
 
             // TODO: Record exports as well
 
-            foreach (var kvp in functionNodes) {
-                FunctionInfo[] dd;
-                if (!data.DirectDependencies.TryGetValue(kvp.Key, out dd))
+            for (uint i = 0; i < functionNodes.Length; i++) {
+                data.TryGetFunction(i, out FunctionInfo fi);
+                var node = functionNodes[i];
+                FunctionInfo[] dds;
+                if (!data.DirectDependencies.TryGetValue(fi, out dds))
                     continue;
 
-                kvp.Value.DirectDependencies = (from fi in dd select functionNodes[fi]).ToArray();
+                node.DirectDependencies = (from dd in dds select functionNodes[dd.Index]).ToArray();
 
-                foreach (var dep in kvp.Value.DirectDependencies) {
-                    if (dep.Function == kvp.Key) {
-                        kvp.Value.Recursions += 1;
+                foreach (var dep in node.DirectDependencies) {
+                    if (dep.Function.Index == i) {
+                        node.Recursions += 1;
                         continue;
                     }
 
-                    if ((kvp.Value.ParentNamespace != null) && (dep.ParentNamespace != null))
-                        kvp.Value.ParentNamespace.ReferencedNamespaces.Add(dep.ParentNamespace);
+                    if ((node.ParentNamespace != null) && (dep.ParentNamespace != null))
+                        node.ParentNamespace.ReferencedNamespaces.Add(dep.ParentNamespace);
 
                     // Propagate dependencies upward
-                    var upward = functionNodes[dep.Function];
+                    var upward = functionNodes[dep.Function.Index];
                     upward.Dependents += 1;
 
                     if (upward.ParentNamespace != null)
@@ -1195,18 +1229,18 @@ namespace WasmStrip {
                 }
             }
 
-            foreach (var kvp in functionNodes)
-                ComputeDeepDependencies(config, data, functionNodes, namespaceNodes, kvp.Value);
+            foreach (var node in functionNodes)
+                ComputeDeepDependencies(config, data, functionNodes, namespaceNodes, node);
 
             foreach (var kvp in namespaceNodes)
                 ComputeDeepDependencies(config, data, functionNodes, namespaceNodes, kvp.Value);
 
-            return (from nsn in namespaceNodes.Values where nsn.ChildFunctions.Count > 1 select nsn).Concat(functionNodes.Values).ToArray();
+            return (from nsn in namespaceNodes.Values where nsn.ChildFunctions.Count > 1 select nsn).Concat(functionNodes).ToArray();
         }
 
         private static void ComputeDeepDependencies (
             Config config, AnalysisData data,
-            Dictionary<FunctionInfo, DependencyGraphNode> functionNodes, 
+            DependencyGraphNode[] functionNodes, 
             Dictionary<string, DependencyGraphNode> namespaceNodes,
             DependencyGraphNode node
         ) {
@@ -1215,17 +1249,17 @@ namespace WasmStrip {
             else
                 node.DeepSize = 0;
 
-            var seenList = new HashSet<FunctionInfo>();
+            var seenBits = new bool[data.Functions.Length];
             var todoList = new Queue<FunctionInfo>();
 
             if (node.DirectDependencies != null) {
                 foreach (var dep in node.DirectDependencies) {
-                    seenList.Add(dep.Function);
+                    seenBits[dep.Function.Index] = true;
                     todoList.Enqueue(dep.Function);
                 }
             } else if (node.ChildFunctions != null) {
                 foreach (var cf in node.ChildFunctions) {
-                    seenList.Add(cf.Function);
+                    seenBits[cf.Function.Index] = true;
                     todoList.Enqueue(cf.Function);
                 }
             }
@@ -1236,15 +1270,16 @@ namespace WasmStrip {
                 node.DeepSize += dep.Body.body_size;
                 node.DeepDependencies += 1;
 
-                var depNode = functionNodes[dep];
+                var depNode = functionNodes[dep.Index];
                 if (depNode.DirectDependencies == null)
                     continue;
 
                 foreach (var subDep in depNode.DirectDependencies) {
-                    if (!seenList.Contains(subDep.Function)) {
-                        seenList.Add(subDep.Function);
-                        todoList.Enqueue(subDep.Function);
-                    }
+                    if (seenBits[subDep.Function.Index])
+                        continue;
+
+                    seenBits[subDep.Function.Index] = true;
+                    todoList.Enqueue(subDep.Function);
                 }
             }
         }
@@ -1252,10 +1287,10 @@ namespace WasmStrip {
         private static Dictionary<FunctionInfo, FunctionInfo[]> ComputeDirectDependencies (
             Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data
         ) {
-            var result = new Dictionary<FunctionInfo, FunctionInfo[]>();
-            var temp = new HashSet<FunctionInfo>();
+            var result = new Dictionary<FunctionInfo, FunctionInfo[]>(data.Functions.Length, FunctionInfo.Comparer);
+            var temp = new HashSet<FunctionInfo>(FunctionInfo.Comparer);
 
-            foreach (var fn in data.Functions.Values) {
+            foreach (var fn in data.Functions) {
                 temp.Clear();
                 GatherDirectDependencies(config, wasmStream, wasmReader, data, fn, temp);
 
@@ -1270,46 +1305,56 @@ namespace WasmStrip {
             return new StreamWindow(function.Stream, function.StreamOffset, function.StreamEnd - function.StreamOffset);
         }
 
+        private class GatherDirectDependenciesVisitor : IExpressionVisitor {
+            public WasmReader wasmReader;
+            public AnalysisData data;
+            public HashSet<FunctionInfo> dependencies;
+
+            public void Visit (ref Expression expr, int depth, out bool wantToVisitChildren) {
+                if (expr.Opcode == Opcodes.call) {
+                    var index = expr.Body.U.u32;
+                    if (index < wasmReader.ImportedFunctionCount) {
+                        // Calling an import
+                    } else {
+                        index -= wasmReader.ImportedFunctionCount;
+                        FunctionInfo callee;
+                        if (!data.TryGetFunction(index, out callee))
+                            throw new Exception($"Invalid call target: {index}");
+                        else
+                            dependencies.Add(callee);
+                    }
+                }
+
+                wantToVisitChildren = true;
+            }
+        }
+
         private static void GatherDirectDependencies (
             Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data, 
             FunctionInfo function, HashSet<FunctionInfo> dependencies
         ) {
             using (var subStream = GetFunctionBodyStream(function.Body)) {
                 var reader = new ExpressionReader(new BinaryReader(subStream));
+                var visitor = new GatherDirectDependenciesVisitor {
+                    wasmReader = wasmReader,
+                    data = data,
+                    dependencies = dependencies
+                };
 
                 Expression expr;
                 while (reader.TryReadExpression(out expr)) {
                     if (!reader.TryReadExpressionBody(ref expr))
                         throw new Exception($"Failed to read body of {expr.Opcode}");
 
-                    GatherDirectDependencies(expr, wasmReader, data, dependencies);
+                    Expression.Visit(ref expr, visitor);
                 }
-            }
-        }
-
-        private static void GatherDirectDependencies (Expression expr, WasmReader wasmReader, AnalysisData data, HashSet<FunctionInfo> dependencies) {
-            if (expr.Opcode == Opcodes.call) {
-                var index = expr.Body.U.u32;
-                if (index < wasmReader.ImportedFunctionCount) {
-                    // Calling an import
-                } else {
-                    index -= wasmReader.ImportedFunctionCount;
-                    FunctionInfo callee;
-                    if (!data.Functions.TryGetValue(index, out callee))
-                        throw new Exception($"Invalid call target: {index}");
-                    else
-                        dependencies.Add(callee);
-                }
-            } else if ((expr.Body.children != null) && (expr.Body.children.Count > 0)) {
-                foreach (var child in expr.Body.children)
-                    GatherDirectDependencies(child, wasmReader, data, dependencies);
             }
         }
 
         private static Dictionary<string, NamespaceInfo> ComputeNamespaceSizes (AnalysisData data) {
-            var namespaces = new Dictionary<string, NamespaceInfo>();
+            var namespaces = new Dictionary<string, NamespaceInfo>(StringComparer.Ordinal);
             int i = 0;
-            foreach (var fn in data.Functions.Values) {
+            foreach (var fn in data.Functions) {
                 if (string.IsNullOrWhiteSpace(fn.Name))
                     continue;
 
