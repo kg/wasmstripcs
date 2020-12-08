@@ -763,6 +763,7 @@ namespace WasmStrip {
             public readonly Dictionary<string, NamespaceInfo> Namespaces;
             public readonly Dictionary<FunctionInfo, FunctionInfo[]> DirectDependencies;
             public readonly DependencyGraphNode[] DependencyGraph;
+            public readonly int[] OpcodeCounts = new int[256];
             public readonly Dictionary<string, object> RawData;
 
             public AnalysisData (Config config, BinaryReader wasmStream, WasmReader wasmReader, FunctionInfo[] functions) {
@@ -785,6 +786,7 @@ namespace WasmStrip {
             }
             
             private class RawDataListener : ExpressionReaderListener {
+                public int[] OpcodeCounts;
                 public int GetLocalRuns, SetLocalRuns, DupCandidates, MaxRunSize, RunCount, AverageRunLengthSum;
                 public int SimpleI32Memops;
                 int CurrentRunSize;
@@ -811,6 +813,8 @@ namespace WasmStrip {
                 }
 
                 public void EndBody (ref Expression expression, bool readChildNodes, bool successful) {
+                    OpcodeCounts[(int)expression.Opcode]++;
+
                     var isLoad = (expression.Opcode >= OpcodesInfo.FirstLoad) && (expression.Opcode <= OpcodesInfo.LastLoad);
                     var isStore = (expression.Opcode >= OpcodesInfo.FirstStore) && (expression.Opcode <= OpcodesInfo.LastStore);
 
@@ -865,7 +869,9 @@ namespace WasmStrip {
             }
 
             private Dictionary<string, object> ComputeRawData (Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData analysisData) {
-                var listener = new RawDataListener();
+                var listener = new RawDataListener {
+                    OpcodeCounts = analysisData.OpcodeCounts
+                };
 
                 foreach (var function in analysisData.Functions) {
                     using (var subStream = GetFunctionBodyStream(function.Body)) {
@@ -1027,7 +1033,7 @@ namespace WasmStrip {
                     output.WriteLine("            <Row>");
                     WriteCell(output, "String", "function");
                     WriteCell(output, "Number", fn.Index.ToString());
-                    WriteCell(output, "String", fn.Name ?? $"#{fn.Index}");
+                    WriteCell(output, "String", fn.Name ?? "");
                     WriteCell(output, "Number", fn.Body.body_size.ToString());
                     WriteCell(output, "String", GetSignatureForType(fn.Type));
                     output.WriteLine("            </Row>");
@@ -1068,6 +1074,24 @@ namespace WasmStrip {
                     output.WriteLine("            <Row>");
                     WriteCell(output, "String", kvp.Key.ToString());
                     WriteCell(output, kvp.Value is string ? "String" : "Number", kvp.Value.ToString());
+                    output.WriteLine("            </Row>");
+                }
+
+                WriteSheetFooter(output, 2);
+
+                WriteSheetHeader(
+                    output, "Opcode Counts",
+                    new[] { 500, 100 },
+                    new[] { "Name", "Count" }
+                );
+
+                for (i = 0; i < data.OpcodeCounts.Length; i++) {
+                    if (data.OpcodeCounts[i] <= 0)
+                        continue;
+                    var name = ((Opcodes)i).ToString();
+                    output.WriteLine("            <Row>");
+                    WriteCell(output, "String", name);
+                    WriteCell(output, "Number", data.OpcodeCounts[i].ToString());
                     output.WriteLine("            </Row>");
                 }
 
