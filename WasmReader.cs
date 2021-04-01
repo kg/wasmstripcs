@@ -31,6 +31,12 @@ namespace WasmStrip {
         private uint? _ImportedFunctionCount,
             _ExportedFunctionCount;
 
+        public uint FunctionIndexOffset {
+            get {
+                return ImportedFunctionCount;
+            }
+        }
+
         public uint ImportedFunctionCount {
             get {
                 if (!_ImportedFunctionCount.HasValue)

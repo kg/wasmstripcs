@@ -257,11 +257,13 @@ namespace WasmStrip {
         }
 
         private static void AssignFunctionNames (Dictionary<uint, FunctionInfo> functions, WasmReader wasmReader) {
+            var offset = wasmReader.FunctionIndexOffset;
             foreach (var kvp in wasmReader.FunctionNames) {
-                var biasedIndex = (kvp.Key - (int)wasmReader.ImportedFunctionCount);
-                if (biasedIndex < 0)
+                // FIXME
+                if (kvp.Key < offset)
                     continue;
 
+                var biasedIndex = kvp.Key - offset;
                 functions[(uint)biasedIndex].Name = kvp.Value;
             }
         }
@@ -489,6 +491,8 @@ namespace WasmStrip {
                 }
 
                 var fileName = name.Replace(":", "_").Replace("\\", "_").Replace("/", "_").Replace("<", "(").Replace(">", ")").Replace("?", "_").Replace("*", "_");
+                if (fileName.Length > 64)
+                    fileName = fileName.Substring(0, 64);
 
                 var path = Path.Combine(config.DumpFunctionsPath, fileName);
 
@@ -654,9 +658,13 @@ namespace WasmStrip {
                 } else {
                     switch (expression.Opcode) {
                         case Opcodes.call:
-                            var func = Functions[expression.Body.U.u32 - FunctionIndexOffset];
-                            Output.Write((func.Name + " ") ?? $"#{expression.Body.U.u32} ");
-                            Output.WriteLine(GetSignatureForType(func.Type));
+                            if (expression.Body.U.u32 >= FunctionIndexOffset) {
+                                var func = Functions[expression.Body.U.u32 - FunctionIndexOffset];
+                                Output.Write((func.Name + " ") ?? $"#{expression.Body.U.u32} ");
+                                Output.WriteLine(GetSignatureForType(func.Type));
+                            } else {
+                                Output.Write($"call import #{expression.Body.U.u32}");
+                            }
                             break;
 
                         case Opcodes.get_local:
@@ -1170,8 +1178,12 @@ namespace WasmStrip {
                 functionNodes[fn.Index] = fnode;
             }
 
-            if ((wasmReader.Tables.entries?.Length ?? 0) > 0)
-                throw new NotImplementedException("Unexpected tables");
+            if ((wasmReader.Tables.entries?.Length ?? 0) > 1)
+                throw new NotImplementedException($"Wasm spec only allows at most 1 table but this module contains {wasmReader.Tables.entries.Length} tables");
+            else if ((wasmReader.Tables.entries?.FirstOrDefault().element_type ?? LanguageTypes.anyfunc) != LanguageTypes.anyfunc)
+                throw new NotImplementedException($"Table of type {wasmReader.Tables.entries[0].element_type} not implemented");
+
+            var functionIndexOffset = wasmReader.FunctionIndexOffset;
 
             var table = new uint[1];
             foreach (var elem in wasmReader.Elements.entries) {
@@ -1192,10 +1204,10 @@ namespace WasmStrip {
 
             // Scan the function pointer table and record function references inside it
             foreach (var elem in table) {
-                if (elem < wasmReader.ImportedFunctionCount)
+                if (elem < functionIndexOffset)
                     continue;
 
-                var adjustedIndex = elem - wasmReader.ImportedFunctionCount;
+                var adjustedIndex = elem - functionIndexOffset;
 
                 FunctionInfo fi;
                 // FIXME: Abort if not found?
@@ -1210,10 +1222,10 @@ namespace WasmStrip {
                 if (export.kind != external_kind.Function)
                     continue;
 
-                if (export.index < wasmReader.ImportedFunctionCount)
+                if (export.index < functionIndexOffset)
                     continue;
 
-                var adjustedIndex = export.index - wasmReader.ImportedFunctionCount;
+                var adjustedIndex = export.index - functionIndexOffset;
 
                 FunctionInfo fi;
                 // FIXME: Abort if not found?
@@ -1337,10 +1349,10 @@ namespace WasmStrip {
             public void Visit (ref Expression expr, int depth, out bool wantToVisitChildren) {
                 if (expr.Opcode == Opcodes.call) {
                     var index = expr.Body.U.u32;
-                    if (index < wasmReader.ImportedFunctionCount) {
+                    if (index < wasmReader.FunctionIndexOffset) {
                         // Calling an import
                     } else {
-                        index -= wasmReader.ImportedFunctionCount;
+                        index -= wasmReader.FunctionIndexOffset;
                         FunctionInfo callee;
                         if (!data.TryGetFunction(index, out callee))
                             throw new Exception($"Invalid call target: {index}");
