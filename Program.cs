@@ -795,6 +795,8 @@ namespace WasmStrip {
             
             private class RawDataListener : ExpressionReaderListener {
                 public int[] OpcodeCounts;
+                public int[] SmallBlockCounts = new int[8];
+                public int AverageBlockLengthSum, BlockCount;
                 public int GetLocalRuns, SetLocalRuns, DupCandidates, MaxRunSize, RunCount, AverageRunLengthSum;
                 public int SimpleI32Memops;
                 int CurrentRunSize;
@@ -822,6 +824,14 @@ namespace WasmStrip {
 
                 public void EndBody (ref Expression expression, bool readChildNodes, bool successful) {
                     OpcodeCounts[(int)expression.Opcode]++;
+
+                    if (expression.Body.Type == ExpressionBody.Types.children) {
+                        var count = expression.Body.children?.Count ?? 0;
+                        BlockCount++;
+                        if (count < SmallBlockCounts.Length)
+                            SmallBlockCounts[count]++;
+                        AverageBlockLengthSum += count;
+                    }
 
                     var isLoad = (expression.Opcode >= OpcodesInfo.FirstLoad) && (expression.Opcode <= OpcodesInfo.LastLoad);
                     var isStore = (expression.Opcode >= OpcodesInfo.FirstStore) && (expression.Opcode <= OpcodesInfo.LastStore);
@@ -899,7 +909,11 @@ namespace WasmStrip {
                     {"DupCandidates", listener.DupCandidates },
                     {"MaxRunSize", listener.MaxRunSize },
                     {"AverageRunLength", listener.AverageRunLengthSum / (double)listener.RunCount },
-                    {"SimpleI32Memops", listener.SimpleI32Memops }
+                    {"SimpleI32Memops", listener.SimpleI32Memops },
+                    {"AverageBlockSize", listener.AverageBlockLengthSum / (double)listener.BlockCount },
+                    {"Num2OpBlocks", listener.SmallBlockCounts[2] },
+                    {"Num3OpBlocks", listener.SmallBlockCounts[3] },
+                    {"Num4OpBlocks", listener.SmallBlockCounts[4] },
                 };
             }
         }
@@ -1104,6 +1118,54 @@ namespace WasmStrip {
                 }
 
                 WriteSheetFooter(output, 2);
+
+                WriteSheetHeader(
+                    output, "Import Export",
+                    new[] { 200, 500, 100 },
+                    new[] { "Kind", "Path", "Type" }
+                );
+
+                foreach (var entry in wasmReader.Imports.entries.OrderBy(e => e.field)) {
+                    output.WriteLine("            <Row>");
+                    WriteCell(output, "String", $"import {entry.kind}");
+                    WriteCell(output, "String", $"{entry.module}.{entry.field}");
+                    switch (entry.kind) {
+                        case external_kind.Function:
+                            var ft = wasmReader.Types.entries[entry.type.Function];
+                            WriteCell(output, "String", GetSignatureForType(ft));
+                            break;
+                        case external_kind.Global:
+                            WriteCell(output, "String", entry.type.Global.content_type.ToString());
+                            break;
+                        default:
+                            WriteCell(output, "String", "");
+                            break;
+                    }
+                    output.WriteLine("            </Row>");
+                }
+
+                foreach (var entry in wasmReader.Exports.entries.OrderBy(e => e.field)) {
+                    output.WriteLine("            <Row>");
+                    WriteCell(output, "String", $"export {entry.kind}");
+                    WriteCell(output, "String", $"{entry.field}");
+                    switch (entry.kind) {
+                        case external_kind.Function:
+                            var relativeIndex = entry.index - wasmReader.ImportedFunctionCount;
+                            if ((relativeIndex >= 0) && (relativeIndex < data.Functions.Length)) {
+                                var fn = data.Functions[relativeIndex];
+                                WriteCell(output, "String", GetSignatureForType(fn.Type));
+                            } else {
+                                WriteCell(output, "String", "?");
+                            }
+                            break;
+                        default:
+                            WriteCell(output, "String", "");
+                            break;
+                    }
+                    output.WriteLine("            </Row>");
+                }
+
+                WriteSheetFooter(output, 3);
 
                 output.WriteLine("</Workbook>");
             }
