@@ -193,7 +193,7 @@ namespace WasmStrip {
                         }
                     }
 
-                    ClearLine("Dumping functions...");
+                    ClearLine("Dumping functions... ");
 
                     if (config.DumpFunctionsPath != null)
                         DumpFunctions(config, wasmStream, wasmReader, functions);
@@ -481,7 +481,7 @@ namespace WasmStrip {
         private static void DumpFunctions (Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
             Directory.CreateDirectory(config.DumpFunctionsPath);
 
-            foreach (var body in wasmReader.Code.bodies) {
+            Parallel.ForEach(wasmReader.Code.bodies, (body) => {
                 var fi = functions[body.Index];
                 var name = fi.Name ?? $"#{body.Index:00000}";
 
@@ -489,7 +489,7 @@ namespace WasmStrip {
                     if (!config.DumpFunctionRegexes.Any((re) => {
                         return re.IsMatch(name);
                     }))
-                        continue;
+                        return;
                 }
 
                 var fileName = name.Replace(":", "_").Replace("\\", "_").Replace("/", "_").Replace("<", "(").Replace(">", ")").Replace("?", "_").Replace("*", "_");
@@ -520,7 +520,7 @@ namespace WasmStrip {
                 } catch (Exception exc) {
                     Console.Error.WriteLine($"Failed to dump function {name}: {exc}");
                 }
-            }
+            });
         }
 
         private class DisassembleListener : ExpressionReaderListener {
@@ -661,9 +661,13 @@ namespace WasmStrip {
                     switch (expression.Opcode) {
                         case Opcodes.call:
                             if (expression.Body.U.u32 >= FunctionIndexOffset) {
-                                var func = Functions[expression.Body.U.u32 - FunctionIndexOffset];
-                                Output.Write((func.Name + " ") ?? $"#{expression.Body.U.u32} ");
-                                Output.WriteLine(GetSignatureForType(func.Type));
+                                var funcIndex = expression.Body.U.u32 - FunctionIndexOffset;
+                                if (!Functions.TryGetValue(funcIndex, out FunctionInfo func)) {
+                                    Output.WriteLine($"Invalid #{funcIndex}");
+                                } else {
+                                    Output.Write((func.Name + " ") ?? $"#{expression.Body.U.u32} ");
+                                    Output.WriteLine(GetSignatureForType(func.Type));
+                                }
                             } else {
                                 Output.Write($"call import #{expression.Body.U.u32}");
                             }
