@@ -527,7 +527,7 @@ namespace WasmStrip {
                             outStream.SetLength(0);
 
                             fb.Position = 0;
-                            DisassembleFunctionBody(name, fb, fi, outStream, functions, wasmReader.ImportedFunctionCount);
+                            DisassembleFunctionBody(name, fb, fi, outStream, functions, wasmReader.ImportedFunctionCount, wasmReader.Types.entries);
                         }
                     } catch (Exception exc) {
                         Console.Error.WriteLine($"Failed to dump function {name}: {exc.Message}");
@@ -544,15 +544,20 @@ namespace WasmStrip {
             public Opcodes LastSeenOpcode;
             readonly uint FunctionIndexOffset;
             readonly FunctionInfo Function;
+            readonly func_type[] Types;
             readonly Dictionary<uint, FunctionInfo> Functions;
             readonly Stack<long> StartOffsets = new Stack<long>();
             readonly Stream Input;
             readonly StreamWriter Output;
 
-            public DisassembleListener (Stream input, StreamWriter output, FunctionInfo function, Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset) {
+            public DisassembleListener (
+                Stream input, StreamWriter output, FunctionInfo function, 
+                Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset, func_type[] types
+            ) {
                 FunctionIndexOffset = functionIndexOffset;
                 Function = function;
                 Functions = functions;
+                Types = types;
                 Input = input;
                 Output = output;
                 Depth = 0;
@@ -690,6 +695,11 @@ namespace WasmStrip {
                             }
                             break;
 
+                        case Opcodes.call_indirect:
+                            var imm = expression.Body.U.call_indirect;
+                            Output.WriteLine($"tables[{imm.table_index}] {GetSignatureForType(Types[imm.sig_index])}");
+                            break;
+
                         case Opcodes.get_local:
                         case Opcodes.set_local:
                         case Opcodes.tee_local:
@@ -758,7 +768,10 @@ namespace WasmStrip {
             }
         }
 
-        private static void DisassembleFunctionBody (string name, Stream stream, FunctionInfo function, FileStream outStream, Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset) {
+        private static void DisassembleFunctionBody (
+            string name, Stream stream, FunctionInfo function, FileStream outStream, 
+            Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset, func_type[] types
+        ) {
             var body = function.Body;
 
             var outWriter = new StreamWriter(outStream, Encoding.UTF8);
@@ -775,7 +788,7 @@ namespace WasmStrip {
                 var fbr = new BinaryReader(stream, Encoding.UTF8, true);
                 var er = new ExpressionReader(fbr);
 
-                var listener = new DisassembleListener(stream, outWriter, function, functions, functionIndexOffset);
+                var listener = new DisassembleListener(stream, outWriter, function, functions, functionIndexOffset, types);
 
                 while (true) {
                     Expression expr;
