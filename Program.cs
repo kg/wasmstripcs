@@ -147,7 +147,7 @@ namespace WasmStrip {
 
                 Console.WriteLine($"Processing module {config.ModulePath}...");
 
-                var wasmStream = ReadModule(config.ModulePath);
+                var wasmStream = ReadModule(config.ModulePath, out byte[] wasmBytes);
                 var functions = new Dictionary<uint, FunctionInfo>();
                 WasmReader wasmReader;
                 using (wasmStream) {
@@ -165,7 +165,7 @@ namespace WasmStrip {
                     ClearLine("Dumping sections...");
 
                     if (config.DumpSectionsPath != null)
-                        DumpSections(config, wasmStream, wasmReader);
+                        DumpSections(config, wasmBytes, wasmReader);
 
                     ClearLine("Analyzing module.");
 
@@ -173,7 +173,7 @@ namespace WasmStrip {
                     if ((config.ReportPath != null) || (config.GraphPath != null)) {
                         var functionArray = new FunctionInfo[functions.Count];
                         functions.Values.CopyTo(functionArray, 0);
-                        data = new AnalysisData(config, wasmStream, wasmReader, functionArray);
+                        data = new AnalysisData(config, wasmBytes, wasmStream, wasmReader, functionArray);
                     }
 
                     ClearLine("Generating reports...");
@@ -201,17 +201,17 @@ namespace WasmStrip {
                     ClearLine("Dumping functions... ");
 
                     if (config.DumpFunctionsPath != null)
-                        DumpFunctions(config, wasmStream, wasmReader, functions);
+                        DumpFunctions(config, wasmBytes, wasmReader, functions);
 
                     ClearLine("Stripping methods...");
                     if (config.StripOutputPath != null) {
-                        GenerateStrippedModule(config, wasmStream, wasmReader, functions);
+                        GenerateStrippedModule(config, wasmBytes, wasmStream, wasmReader, functions);
 
                         var shouldReadOutput = config.VerifyOutput || (config.StripReportPath != null);
                         if (shouldReadOutput) {
                             var resultFunctions = new Dictionary<uint, FunctionInfo>();
 
-                            using (var resultReader = ReadModule(config.StripOutputPath)) {
+                            using (var resultReader = ReadModule(config.StripOutputPath, out _)) {
                                 ClearLine("Reading stripped module...");
                                 var resultWasmReader = new WasmReader(resultReader);
                                 resultWasmReader.FunctionBodyCallback = (fb, br) => {
@@ -226,7 +226,7 @@ namespace WasmStrip {
                                     ClearLine("Analyzing stripped module.");
                                     var resultArray = new FunctionInfo[resultFunctions.Count];
                                     resultFunctions.Values.CopyTo(resultArray, 0);
-                                    var newData = new AnalysisData(config, resultReader, resultWasmReader, resultArray);
+                                    var newData = new AnalysisData(config, wasmBytes, resultReader, resultWasmReader, resultArray);
 
                                     GenerateReport(config, resultReader, resultWasmReader, newData, config.StripReportPath);
                                 }
@@ -277,9 +277,9 @@ namespace WasmStrip {
             }
         }
 
-        private static BinaryReader ReadModule (string path) {
-            var wasmBytes = File.ReadAllBytes(path);
-            var stream = new MemoryStream(wasmBytes);
+        private static BinaryReader ReadModule (string path, out byte[] wasmBytes) {
+            wasmBytes = File.ReadAllBytes(path);
+            var stream = new MemoryStream(wasmBytes, false);
             return new BinaryReader(stream, Encoding.UTF8, false);
         }
 
@@ -296,23 +296,14 @@ namespace WasmStrip {
             Directory.CreateDirectory(directoryName);
         }
 
-        private static Stream GetSectionStream (BinaryReader stream, SectionHeader header, bool includeHeader, bool threadSafe) {
-            lock (stream.BaseStream) {
-                var startOffset = includeHeader ? header.StreamHeaderStart - 1 : header.StreamPayloadStart;
-                var size = (int)(header.StreamPayloadEnd - startOffset);
-                var result = new StreamWindow(stream.BaseStream, startOffset, size);
-                if (threadSafe) {
-                    var copy = new MemoryStream(size);
-                    result.CopyTo(copy);
-                    return copy;
-                } else if (Thread.CurrentThread != Program.MainThread)
-                    throw new Exception("Must create thread safe stream unless on main thread");
-                return result;
-            }
+        private static Stream GetSectionStream (byte[] bytes, SectionHeader header, bool includeHeader) {
+            var startOffset = includeHeader ? header.StreamHeaderStart - 1 : header.StreamPayloadStart;
+            var size = (int)(header.StreamPayloadEnd - startOffset);
+            return new MemoryStream(bytes, (int)startOffset, size, false);
         }
 
         private static void GenerateStrippedModule (
-            Config config, BinaryReader wasmStream, WasmReader wasmReader,
+            Config config, byte[] wasmBytes, BinaryReader wasmStream, WasmReader wasmReader,
             Dictionary<uint, FunctionInfo> functions
         ) {
             EnsureValidPath(config.StripOutputPath);
@@ -328,7 +319,7 @@ namespace WasmStrip {
                         case SectionTypes.Code:
                             using (var sectionScratch = new MemoryStream(1024 * 1024))
                             using (var sectionScratchWriter = new BinaryWriter(sectionScratch, Encoding.UTF8, true)) {
-                                GenerateStrippedCodeSection(config, wasmStream, wasmReader, functions, sh, sectionScratchWriter);
+                                GenerateStrippedCodeSection(config, wasmBytes, wasmStream, wasmReader, functions, sh, sectionScratchWriter);
                                 sectionScratchWriter.Flush();
 
                                 o.Write((sbyte)sh.id);
@@ -341,7 +332,7 @@ namespace WasmStrip {
                             break;
 
                         default:
-                            using (var ss = GetSectionStream(wasmStream, sh, true, false)) {
+                            using (var ss = GetSectionStream(wasmBytes, sh, true)) {
                                 o.Flush();
 
                                 ss.Position = 0;
@@ -353,7 +344,7 @@ namespace WasmStrip {
             }
         }
 
-        private static void GenerateStrippedCodeSection (Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions, SectionHeader sh, BinaryWriter output) {
+        private static void GenerateStrippedCodeSection (Config config, byte[] wasmBytes, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions, SectionHeader sh, BinaryWriter output) {
             output.WriteLEB((uint)wasmReader.Code.bodies.Length);
 
             var scratchBuffer = new MemoryStream(102400);
@@ -372,7 +363,7 @@ namespace WasmStrip {
                         Console.WriteLine($"// Stripping {name}");
                         GenerateStrippedFunctionBody(body, scratch);
                     } else {
-                        CopyExistingFunctionBody(body, scratch);
+                        CopyExistingFunctionBody(wasmBytes, body, scratch);
                     }
 
                     scratch.Flush();
@@ -451,8 +442,8 @@ namespace WasmStrip {
             EmitExpression(output, ref expr);
         }
 
-        private static void CopyExistingFunctionBody (function_body body, BinaryWriter output) {
-            using (var fb = GetFunctionBodyStream(body, false)) {
+        private static void CopyExistingFunctionBody (byte[] bytes, function_body body, BinaryWriter output) {
+            using (var fb = GetFunctionBodyStream(bytes, body)) {
                 output.WriteLEB((uint)body.locals.Length);
                 foreach (var l in body.locals) {
                     output.WriteLEB(l.count);
@@ -464,7 +455,7 @@ namespace WasmStrip {
             }
         }
 
-        private static void DumpSections (Config config, BinaryReader wasmStream, WasmReader wasmReader) {
+        private static void DumpSections (Config config, byte[] wasmBytes, WasmReader wasmReader) {
             Directory.CreateDirectory(config.DumpSectionsPath);
 
             for (int i = 0; i < wasmReader.SectionHeaders.Count; i++) {
@@ -486,7 +477,7 @@ namespace WasmStrip {
                 try {
                     using (var outStream = File.OpenWrite(path)) {
                         outStream.SetLength(0);
-                        using (var sw = GetSectionStream(wasmStream, sh, false, false))
+                        using (var sw = GetSectionStream(wasmBytes, sh, false))
                             sw.CopyTo(outStream);
                     }
                 } catch (Exception exc) {
@@ -495,7 +486,7 @@ namespace WasmStrip {
             }
         }
 
-        private static void DumpFunctions (Config config, BinaryReader wasmStream, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
+        private static void DumpFunctions (Config config, byte[] wasmBytes, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
             Directory.CreateDirectory(config.DumpFunctionsPath);
 
             Parallel.ForEach(wasmReader.Code.bodies, (body) => {
@@ -515,29 +506,32 @@ namespace WasmStrip {
 
                 var path = Path.Combine(config.DumpFunctionsPath, fileName);
 
-                try {
-                    if (config.DumpFunctions)
-                    using (var outStream = File.OpenWrite(path)) {
-                        outStream.SetLength(0);
+                using (var fb = GetFunctionBodyStream(wasmBytes, body)) {
+                    try {
+                        if (config.DumpFunctions)
+                            using (var outStream = File.OpenWrite(path)) {
+                                outStream.SetLength(0);
 
-                        using (var fb = GetFunctionBodyStream(body, true))
-                            fb.CopyTo(outStream);
+                                fb.Position = 0;
+                                fb.CopyTo(outStream);
+                            }
+                    } catch (Exception exc) {
+                        Console.Error.WriteLine($"Failed to dump function {name}: {exc}");
                     }
-                } catch (Exception exc) {
-                    Console.Error.WriteLine($"Failed to dump function {name}: {exc}");
-                }
 
-                path = Path.Combine(config.DumpFunctionsPath, fileName + ".dis");
+                    path = Path.Combine(config.DumpFunctionsPath, fileName + ".dis");
 
-                try {
-                    if (config.DisassembleFunctions)
-                    using (var outStream = File.OpenWrite(path)) {
-                        outStream.SetLength(0);
+                    try {
+                        if (config.DisassembleFunctions)
+                        using (var outStream = File.OpenWrite(path)) {
+                            outStream.SetLength(0);
 
-                        DisassembleFunctionBody(name, fi, outStream, functions, wasmReader.ImportedFunctionCount);
+                            fb.Position = 0;
+                            DisassembleFunctionBody(name, fb, fi, outStream, functions, wasmReader.ImportedFunctionCount);
+                        }
+                    } catch (Exception exc) {
+                        Console.Error.WriteLine($"Failed to dump function {name}: {exc.Message}");
                     }
-                } catch (Exception exc) {
-                    Console.Error.WriteLine($"Failed to dump function {name}: {exc.Message}");
                 }
             });
         }
@@ -764,7 +758,7 @@ namespace WasmStrip {
             }
         }
 
-        private static void DisassembleFunctionBody (string name, FunctionInfo function, FileStream outStream, Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset) {
+        private static void DisassembleFunctionBody (string name, Stream stream, FunctionInfo function, FileStream outStream, Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset) {
             var body = function.Body;
 
             var outWriter = new StreamWriter(outStream, Encoding.UTF8);
@@ -778,24 +772,22 @@ namespace WasmStrip {
             outWriter.WriteLine();
 
             try {
-                using (var fb = GetFunctionBodyStream(body, true)) {
-                    var fbr = new BinaryReader(fb, Encoding.UTF8, true);
-                    var er = new ExpressionReader(fbr);
+                var fbr = new BinaryReader(stream, Encoding.UTF8, true);
+                var er = new ExpressionReader(fbr);
 
-                    var listener = new DisassembleListener(fb, outWriter, function, functions, functionIndexOffset);
+                var listener = new DisassembleListener(stream, outWriter, function, functions, functionIndexOffset);
 
-                    while (true) {
-                        Expression expr;
-                        if (!er.TryReadExpression(out expr, listener))
-                            break;
-                        if (!er.TryReadExpressionBody(ref expr, listener))
-                            break;
-                    }
-
-                    if (listener.LastSeenOpcode != Opcodes.end)
-                        outWriter.WriteLine("ERROR: Function body did not end with an 'end' opcode");
-                    outWriter.Flush();
+                while (true) {
+                    Expression expr;
+                    if (!er.TryReadExpression(out expr, listener))
+                        break;
+                    if (!er.TryReadExpressionBody(ref expr, listener))
+                        break;
                 }
+
+                if (listener.LastSeenOpcode != Opcodes.end)
+                    outWriter.WriteLine("ERROR: Function body did not end with an 'end' opcode");
+                outWriter.Flush();
             } catch (Exception exc) {
                 outWriter.WriteLine();
                 outWriter.WriteLine("ERROR: Exception while disassembling function");
@@ -813,15 +805,15 @@ namespace WasmStrip {
             public readonly int[] OpcodeCounts = new int[256];
             public readonly Dictionary<string, object> RawData;
 
-            public AnalysisData (Config config, BinaryReader wasmStream, WasmReader wasmReader, FunctionInfo[] functions) {
+            public AnalysisData (Config config, byte[] wasmBytes, BinaryReader wasmStream, WasmReader wasmReader, FunctionInfo[] functions) {
                 Functions = functions;
                 Namespaces = ComputeNamespaceSizes(this);
                 Console.Write(".");
-                DirectDependencies = ComputeDirectDependencies(config, wasmStream, wasmReader, this);
+                DirectDependencies = ComputeDirectDependencies(config, wasmBytes, wasmStream, wasmReader, this);
                 Console.Write(".");
                 DependencyGraph = ComputeDependencyGraph(config, wasmStream, wasmReader, this);
                 Console.Write(".");
-                RawData = ComputeRawData(config, wasmStream, wasmReader, this);
+                RawData = ComputeRawData(config, wasmBytes, wasmStream, wasmReader, this);
             }
 
             public bool TryGetFunction (uint index, out FunctionInfo result) {
@@ -925,13 +917,13 @@ namespace WasmStrip {
                 }
             }
 
-            private Dictionary<string, object> ComputeRawData (Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData analysisData) {
+            private Dictionary<string, object> ComputeRawData (Config config, byte[] wasmBytes, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData analysisData) {
                 var listener = new RawDataListener {
                     OpcodeCounts = analysisData.OpcodeCounts
                 };
 
                 foreach (var function in analysisData.Functions) {
-                    using (var subStream = GetFunctionBodyStream(function.Body, false)) {
+                    using (var subStream = GetFunctionBodyStream(wasmBytes, function.Body)) {
                         var reader = new ExpressionReader(new BinaryReader(subStream));
 
                         Expression expr;
@@ -1428,14 +1420,14 @@ namespace WasmStrip {
         }
 
         private static Dictionary<FunctionInfo, FunctionInfo[]> ComputeDirectDependencies (
-            Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data
+            Config config, byte[] wasmBytes, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data
         ) {
             var result = new Dictionary<FunctionInfo, FunctionInfo[]>(data.Functions.Length, FunctionInfo.Comparer);
             var temp = new HashSet<FunctionInfo>(FunctionInfo.Comparer);
 
             foreach (var fn in data.Functions) {
                 temp.Clear();
-                GatherDirectDependencies(config, wasmStream, wasmReader, data, fn, temp);
+                GatherDirectDependencies(config, wasmBytes, wasmStream, wasmReader, data, fn, temp);
 
                 if (temp.Count > 0)
                     result[fn] = temp.ToArray();
@@ -1444,18 +1436,10 @@ namespace WasmStrip {
             return result;
         }
 
-        private static Stream GetFunctionBodyStream (function_body function, bool threadSafe) {
-            lock (function.Stream) {
-                var size = (int)(function.StreamEnd - function.StreamOffset);
-                var result = new StreamWindow(function.Stream, function.StreamOffset, size);
-                if (threadSafe) {
-                    var copy = new MemoryStream(size);
-                    result.CopyTo(copy);
-                    return copy;
-                } else if (Thread.CurrentThread != Program.MainThread)
-                    throw new Exception("Must create thread safe stream unless on main thread");
-                return result;
-            }
+        private static Stream GetFunctionBodyStream (byte[] bytes, function_body function) {
+            var size = (int)(function.StreamEnd - function.StreamOffset);
+            var result = new MemoryStream(bytes, (int)function.StreamOffset, size, false);
+            return result;
         }
 
         private class GatherDirectDependenciesVisitor : IExpressionVisitor {
@@ -1483,10 +1467,10 @@ namespace WasmStrip {
         }
 
         private static void GatherDirectDependencies (
-            Config config, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data, 
+            Config config, byte[] wasmBytes, BinaryReader wasmStream, WasmReader wasmReader, AnalysisData data, 
             FunctionInfo function, HashSet<FunctionInfo> dependencies
         ) {
-            using (var subStream = GetFunctionBodyStream(function.Body, false)) {
+            using (var subStream = GetFunctionBodyStream(wasmBytes, function.Body)) {
                 var reader = new ExpressionReader(new BinaryReader(subStream));
                 var visitor = new GatherDirectDependenciesVisitor {
                     wasmReader = wasmReader,
