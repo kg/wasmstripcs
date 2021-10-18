@@ -11,6 +11,8 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Wasm.Model;
 using ModuleSaw;
+using System.Threading.Tasks;
+using System.Threading;
 
 namespace WasmStrip {
     class ReferenceComparer<T> : IEqualityComparer<T> {
@@ -1121,12 +1123,14 @@ namespace WasmStrip {
 
                 WriteSheetHeader(
                     output, "Import Export",
-                    new[] { 200, 500, 100 },
-                    new[] { "Kind", "Path", "Type" }
+                    new[] { 100, 100, 400, 100 },
+                    new[] { "Index", "Kind", "Path", "Type" }
                 );
 
-                foreach (var entry in wasmReader.Imports.entries.OrderBy(e => e.field)) {
+                for (int j = 0; j < wasmReader.Imports.entries.Length; j++) {
+                    var entry = wasmReader.Imports.entries[j];
                     output.WriteLine("            <Row>");
+                    WriteCell(output, "Number", j.ToString());
                     WriteCell(output, "String", $"import {entry.kind}");
                     WriteCell(output, "String", $"{entry.module}.{entry.field}");
                     switch (entry.kind) {
@@ -1144,8 +1148,10 @@ namespace WasmStrip {
                     output.WriteLine("            </Row>");
                 }
 
-                foreach (var entry in wasmReader.Exports.entries.OrderBy(e => e.field)) {
+                for (int j = 0; j < wasmReader.Exports.entries.Length; j++) {
+                    var entry = wasmReader.Exports.entries[j];
                     output.WriteLine("            <Row>");
+                    WriteCell(output, "Number", j.ToString());
                     WriteCell(output, "String", $"export {entry.kind}");
                     WriteCell(output, "String", $"{entry.field}");
                     switch (entry.kind) {
@@ -1165,7 +1171,7 @@ namespace WasmStrip {
                     output.WriteLine("            </Row>");
                 }
 
-                WriteSheetFooter(output, 3);
+                WriteSheetFooter(output, 4);
 
                 output.WriteLine("</Workbook>");
             }
@@ -1327,19 +1333,17 @@ namespace WasmStrip {
                 }
             }
 
-            foreach (var node in functionNodes)
-                ComputeDeepDependencies(config, data, functionNodes, namespaceNodes, node);
-
-            foreach (var kvp in namespaceNodes)
-                ComputeDeepDependencies(config, data, functionNodes, namespaceNodes, kvp.Value);
+            Parallel.ForEach(functionNodes, (node) => ComputeDeepDependencies(config, data, functionNodes, node));
+            Parallel.ForEach(namespaceNodes, (kvp) => ComputeDeepDependencies(config, data, functionNodes, kvp.Value));
 
             return (from nsn in namespaceNodes.Values where nsn.ChildFunctions.Count > 1 select nsn).Concat(functionNodes).ToArray();
         }
 
+        private static ThreadLocal<bool[]> SeenBits = new ThreadLocal<bool[]>();
+
         private static void ComputeDeepDependencies (
             Config config, AnalysisData data,
-            DependencyGraphNode[] functionNodes, 
-            Dictionary<string, DependencyGraphNode> namespaceNodes,
+            DependencyGraphNode[] functionNodes,
             DependencyGraphNode node
         ) {
             if (node.Function != null)
@@ -1347,7 +1351,11 @@ namespace WasmStrip {
             else
                 node.DeepSize = 0;
 
-            var seenBits = new bool[data.Functions.Length];
+            var seenBits = SeenBits.Value;
+            if ((seenBits == null) || (seenBits.Length != data.Functions.Length))
+                seenBits = SeenBits.Value = new bool[data.Functions.Length];
+            else
+                Array.Clear(seenBits, 0, seenBits.Length);
             var todoList = new Queue<FunctionInfo>();
 
             if (node.DirectDependencies != null) {
