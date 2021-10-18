@@ -122,7 +122,7 @@ namespace WasmStrip {
         private void ReadNameSection (ModuleReader reader, BinaryReader sr, SectionHeader nameSectionHeader) {
             var bs = sr.BaseStream;
             while ((bs.Position < nameSectionHeader.StreamPayloadEnd) && (bs.Position < bs.Length)) {
-                var id = reader.Reader.ReadByte();
+                var id = reader.Reader.ReadByteButFast();
                 var size = (uint)reader.Reader.ReadLEBUInt();
                 switch (id) {
                     // Function names
