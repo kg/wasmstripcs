@@ -489,7 +489,14 @@ namespace WasmStrip {
         private static void DumpFunctions (Config config, byte[] wasmBytes, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
             Directory.CreateDirectory(config.DumpFunctionsPath);
 
+            int count = 0;
+
             Parallel.ForEach(wasmReader.Code.bodies, (body) => {
+                var i = Interlocked.Increment(ref count);
+                if (((i % 5000) == 0) && (i > 0)) {
+                    ClearLine($"Dumping functions... {i}/{functions.Count}");
+                }
+
                 var fi = functions[body.Index];
                 var name = fi.Name ?? $"#{body.Index:00000}";
 
@@ -502,10 +509,11 @@ namespace WasmStrip {
 
                 var fileName = name.Replace(":", "_").Replace("\\", "_").Replace("/", "_").Replace("<", "(").Replace(">", ")").Replace("?", "_").Replace("*", "_");
                 if (fileName.Length > 64)
-                    fileName = fileName.Substring(0, 64);
+                    fileName = fileName.Substring(0, 64) + name.GetHashCode().ToString("X8");
 
                 var path = Path.Combine(config.DumpFunctionsPath, fileName);
 
+                var inBytes = new ArraySegment<byte>(wasmBytes, (int)body.StreamOffset, (int)(body.StreamEnd - body.StreamOffset));
                 using (var fb = GetFunctionBodyStream(wasmBytes, body)) {
                     try {
                         if (config.DumpFunctions)
@@ -527,7 +535,7 @@ namespace WasmStrip {
                             outStream.SetLength(0);
 
                             fb.Position = 0;
-                            DisassembleFunctionBody(name, fb, fi, outStream, functions, wasmReader.ImportedFunctionCount, wasmReader.Types.entries);
+                            DisassembleFunctionBody(name, fb, fi, inBytes, outStream, functions, wasmReader.ImportedFunctionCount, wasmReader.Types.entries);
                         }
                     } catch (Exception exc) {
                         Console.Error.WriteLine($"Failed to dump function {name}: {exc.Message}");
@@ -548,10 +556,11 @@ namespace WasmStrip {
             readonly Dictionary<uint, FunctionInfo> Functions;
             readonly Stack<long> StartOffsets = new Stack<long>();
             readonly Stream Input;
+            readonly ArraySegment<byte> InputBytes;
             readonly StreamWriter Output;
 
             public DisassembleListener (
-                Stream input, StreamWriter output, FunctionInfo function, 
+                Stream input, ArraySegment<byte> inputBytes, StreamWriter output, FunctionInfo function, 
                 Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset, func_type[] types
             ) {
                 FunctionIndexOffset = functionIndexOffset;
@@ -559,6 +568,7 @@ namespace WasmStrip {
                 Functions = functions;
                 Types = types;
                 Input = input;
+                InputBytes = inputBytes;
                 Output = output;
                 Depth = 0;
             }
@@ -593,33 +603,40 @@ namespace WasmStrip {
                 StartOffsets.Push(Input.Position);
             }
 
-            private string RangeToBytes (long startOffset, long endOffset) {
-                var sb = new StringBuilder();
+            static string[] ByteStrings = new string[256];
+            static DisassembleListener () {
+                for (int i = 0; i < 256; i++)
+                    ByteStrings[i] = i.ToString("X2");
+            }
+
+            char[] RangeBuffer = new char[10240];
+            StringBuilder RangeBuilder = new StringBuilder();
+
+            private void RangeToBytes (long startOffset, long endOffset, StreamWriter output) {
+                var sb = RangeBuilder;
+                sb.Clear();
+
                 var position = Input.Position;
-                try {
-                    Input.Seek(startOffset, SeekOrigin.Begin);
-                    var count = (int)(endOffset - startOffset);
-                    var bytes = new byte[count];
-                    Input.Read(bytes, 0, count);
+                var count = (int)(endOffset - startOffset);
+                var bytes = new byte[count];
 
-                    int lineOffset = 0;
-                    for (int i = 0; i < count; i++) {
-                        if (sb.Length - lineOffset >= BytesWidth) {
-                            sb.AppendLine(" ...");
-                            lineOffset = sb.Length;
-                        }
-
-                        sb.Append(bytes[i].ToString("X2"));
+                int lineOffset = 0;
+                for (int i = 0; i < count; i++) {
+                    var b = InputBytes.Array[startOffset + i + InputBytes.Offset];
+                    if (sb.Length - lineOffset >= BytesWidth) {
+                        sb.AppendLine(" ...");
+                        lineOffset = sb.Length;
                     }
 
-                    // HACK
-                    while (sb.Length - lineOffset < BytesWidth)
-                        sb.Append(' ');
-
-                    return sb.ToString();
-                } finally {
-                    Input.Seek(position, SeekOrigin.Begin);
+                    sb.Append(ByteStrings[b]);
                 }
+
+                // HACK
+                while (sb.Length - lineOffset < BytesWidth)
+                    sb.Append(' ');
+
+                sb.CopyTo(0, RangeBuffer, 0, sb.Length);
+                output.Write(RangeBuffer, 0, sb.Length);
             }
 
             private void WriteHeader (ref Expression expression) {
@@ -630,9 +647,8 @@ namespace WasmStrip {
                 var startOffset = StartOffsets.Pop();
                 var endOffset = Input.Position;
 
-                var disassembly = RangeToBytes(startOffset, endOffset);
-                Output.Write(disassembly);
-
+                RangeToBytes(startOffset, endOffset, Output);
+                
                 WriteIndented(0, expression.Opcode.ToString() + " ");
 
                 if (expression.Body.Type == ExpressionBody.Types.type)
@@ -769,7 +785,7 @@ namespace WasmStrip {
         }
 
         private static void DisassembleFunctionBody (
-            string name, Stream stream, FunctionInfo function, FileStream outStream, 
+            string name, Stream stream, FunctionInfo function, ArraySegment<byte> inputBytes, FileStream outStream, 
             Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset, func_type[] types
         ) {
             var body = function.Body;
@@ -788,7 +804,7 @@ namespace WasmStrip {
                 var fbr = new BinaryReader(stream, Encoding.UTF8, true);
                 var er = new ExpressionReader(fbr);
 
-                var listener = new DisassembleListener(stream, outWriter, function, functions, functionIndexOffset, types);
+                var listener = new DisassembleListener(stream, inputBytes, outWriter, function, functions, functionIndexOffset, types);
 
                 while (true) {
                     Expression expr;
@@ -815,7 +831,7 @@ namespace WasmStrip {
             public readonly Dictionary<string, NamespaceInfo> Namespaces;
             public readonly Dictionary<FunctionInfo, FunctionInfo[]> DirectDependencies;
             public readonly DependencyGraphNode[] DependencyGraph;
-            public readonly int[] OpcodeCounts = new int[256];
+            public readonly int[] OpcodeCounts = new int[0xFFFF];
             public readonly Dictionary<string, object> RawData;
 
             public AnalysisData (Config config, byte[] wasmBytes, BinaryReader wasmStream, WasmReader wasmReader, FunctionInfo[] functions) {
@@ -936,14 +952,18 @@ namespace WasmStrip {
                 };
 
                 foreach (var function in analysisData.Functions) {
-                    using (var subStream = GetFunctionBodyStream(wasmBytes, function.Body)) {
-                        var reader = new ExpressionReader(new BinaryReader(subStream));
+                    try {
+                        using (var subStream = GetFunctionBodyStream(wasmBytes, function.Body)) {
+                            var reader = new ExpressionReader(new BinaryReader(subStream));
 
-                        Expression expr;
-                        while (reader.TryReadExpression(out expr, listener)) {
-                            if (!reader.TryReadExpressionBody(ref expr, listener))
-                                throw new Exception($"Failed to read body of {expr.Opcode}");
+                            Expression expr;
+                            while (reader.TryReadExpression(out expr, listener)) {
+                                if (!reader.TryReadExpressionBody(ref expr, listener))
+                                    throw new Exception($"Failed to read body of {expr.Opcode}");
+                            }
                         }
+                    } catch (Exception exc) {
+                        Console.Error.WriteLine($"Error analyzing function #{function.Index} '{function.Name}': {exc.Message}");
                     }
                 }
 
@@ -1440,10 +1460,14 @@ namespace WasmStrip {
 
             foreach (var fn in data.Functions) {
                 temp.Clear();
-                GatherDirectDependencies(config, wasmBytes, wasmStream, wasmReader, data, fn, temp);
+                try {
+                    GatherDirectDependencies(config, wasmBytes, wasmStream, wasmReader, data, fn, temp);
 
-                if (temp.Count > 0)
-                    result[fn] = temp.ToArray();
+                    if (temp.Count > 0)
+                        result[fn] = temp.ToArray();
+                } catch (Exception exc) {
+                    Console.Error.WriteLine($"Error while analyzing function #{fn.Index} {fn.Name}: {exc.Message}");
+                }
             }
 
             return result;
