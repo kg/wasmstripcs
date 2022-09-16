@@ -791,7 +791,7 @@ namespace WasmStrip {
             var body = function.Body;
 
             var outWriter = new StreamWriter(outStream, Encoding.UTF8);
-            outWriter.WriteLine($"{name} -> {function.Type.return_type} ({function.Body.body_size} byte(s))");
+            outWriter.WriteLine($"{name} ( {string.Join(", ", function.Type.param_types)} ) -> {function.Type.return_type} ({function.Body.body_size} byte(s))");
             if (body.locals.Length > 0) {
                 outWriter.WriteLine($"{body.locals.Sum(l => l.count)} local(s)");
                 foreach (var l in body.locals)
