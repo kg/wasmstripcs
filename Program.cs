@@ -161,6 +161,7 @@ namespace WasmStrip {
                     wasmReader.Read();
 
                     AssignFunctionNames(functions, wasmReader);
+                    AssignImportNames(wasmReader);
 
                     ClearLine("Dumping sections...");
 
@@ -263,6 +264,18 @@ namespace WasmStrip {
             }
 
             return 0;
+        }
+
+        private static void AssignImportNames (WasmReader wasmReader) {
+            var imports = wasmReader.Imports.entries;
+            for (int i = 0; i < imports.Length; i++) {
+                var import = imports[i];
+                if (import.kind != external_kind.Function)
+                    continue;
+                if (wasmReader.FunctionNames.TryGetValue((uint)i, out var s) && !string.IsNullOrWhiteSpace(s))
+                    continue;
+                wasmReader.FunctionNames[(uint)i] = $"{import.module}.{import.field}";
+            }
         }
 
         private static void AssignFunctionNames (Dictionary<uint, FunctionInfo> functions, WasmReader wasmReader) {
@@ -498,18 +511,17 @@ namespace WasmStrip {
                 }
 
                 var fi = functions[body.Index];
-                var name = fi.Name ?? $"#{body.Index:00000}";
+                var indexStr = $"#{body.Index:00000}";
+                var name = fi.Name ?? indexStr;
 
                 if (config.DumpFunctionRegexes.Count > 0) {
-                    if (!config.DumpFunctionRegexes.Any((re) => {
-                        return re.IsMatch(name);
-                    }))
+                    if (!config.DumpFunctionRegexes.Any((re) => re.IsMatch(name) || re.IsMatch(indexStr)))
                         return;
                 }
 
                 var fileName = name.Replace(":", "_").Replace("\\", "_").Replace("/", "_").Replace("<", "(").Replace(">", ")").Replace("?", "_").Replace("*", "_");
-                if (fileName.Length > 64)
-                    fileName = fileName.Substring(0, 64) + name.GetHashCode().ToString("X8");
+                if (fileName.Length > 127)
+                    fileName = fileName.Substring(0, 127) + name.GetHashCode().ToString("X8");
 
                 var path = Path.Combine(config.DumpFunctionsPath, fileName);
 
@@ -535,7 +547,10 @@ namespace WasmStrip {
                             outStream.SetLength(0);
 
                             fb.Position = 0;
-                            DisassembleFunctionBody(name, fb, fi, inBytes, outStream, functions, wasmReader.ImportedFunctionCount, wasmReader.Types.entries);
+                            DisassembleFunctionBody(
+                                name, fb, fi, inBytes, outStream, wasmReader.FunctionNames, functions, 
+                                wasmReader.ImportedFunctionCount, wasmReader.Types.entries
+                            );
                         }
                     } catch (Exception exc) {
                         Console.Error.WriteLine($"Failed to dump function {name}: {exc.Message}");
@@ -553,6 +568,7 @@ namespace WasmStrip {
             readonly uint FunctionIndexOffset;
             readonly FunctionInfo Function;
             readonly func_type[] Types;
+            readonly Dictionary<uint, string> FunctionNames;
             readonly Dictionary<uint, FunctionInfo> Functions;
             readonly Stack<long> StartOffsets = new Stack<long>();
             readonly Stream Input;
@@ -560,11 +576,13 @@ namespace WasmStrip {
             readonly StreamWriter Output;
 
             public DisassembleListener (
-                Stream input, ArraySegment<byte> inputBytes, StreamWriter output, FunctionInfo function, 
-                Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset, func_type[] types
+                Stream input, ArraySegment<byte> inputBytes, StreamWriter output, FunctionInfo function,
+                Dictionary<uint, string> functionNames, Dictionary<uint, FunctionInfo> functions, 
+                uint functionIndexOffset, func_type[] types
             ) {
                 FunctionIndexOffset = functionIndexOffset;
                 Function = function;
+                FunctionNames = functionNames;
                 Functions = functions;
                 Types = types;
                 Input = input;
@@ -576,10 +594,10 @@ namespace WasmStrip {
             private string GetIndent (int offset, int depth) {
                 const int threshold = 24;
                 if (depth < threshold) {
-                    return new string(' ', Depth + offset);
+                    return new string('.', (Depth * 2) + offset);
                 } else {
                     var counter = $"{depth} > ";
-                    return new string(' ', threshold + offset - counter.Length) + counter;
+                    return new string('.', (threshold * 2) + offset - counter.Length) + counter;
                 }
             }
 
@@ -618,7 +636,8 @@ namespace WasmStrip {
 
                 var position = Input.Position;
                 var count = (int)(endOffset - startOffset);
-                var bytes = new byte[count];
+
+                sb.AppendFormat("{0:0000} ", startOffset + InputBytes.Offset);
 
                 int lineOffset = 0;
                 for (int i = 0; i < count; i++) {
@@ -651,7 +670,7 @@ namespace WasmStrip {
                 
                 WriteIndented(0, expression.Opcode.ToString() + " ");
 
-                if (expression.Body.Type == ExpressionBody.Types.type)
+                if ((expression.Body.Type & ExpressionBody.Types.type) == ExpressionBody.Types.type)
                     Output.Write($"{expression.Body.U.type} ");
 
                 Depth += 1;
@@ -707,7 +726,8 @@ namespace WasmStrip {
                                     Output.WriteLine(GetSignatureForType(func.Type));
                                 }
                             } else {
-                                Output.WriteLine($"<import #{expression.Body.U.u32}>");
+                                FunctionNames.TryGetValue(expression.Body.U.u32, out var importName);
+                                Output.WriteLine(importName ?? $"<import #{expression.Body.U.u32}>");
                             }
                             break;
 
@@ -786,7 +806,7 @@ namespace WasmStrip {
 
         private static void DisassembleFunctionBody (
             string name, Stream stream, FunctionInfo function, ArraySegment<byte> inputBytes, FileStream outStream, 
-            Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset, func_type[] types
+            Dictionary<uint, string> functionNames, Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset, func_type[] types
         ) {
             var body = function.Body;
 
@@ -804,7 +824,7 @@ namespace WasmStrip {
                 var fbr = new BinaryReader(stream, Encoding.UTF8, true);
                 var er = new ExpressionReader(fbr);
 
-                var listener = new DisassembleListener(stream, inputBytes, outWriter, function, functions, functionIndexOffset, types);
+                var listener = new DisassembleListener(stream, inputBytes, outWriter, function, functionNames, functions, functionIndexOffset, types);
 
                 while (true) {
                     Expression expr;
