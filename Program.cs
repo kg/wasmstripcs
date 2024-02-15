@@ -13,6 +13,7 @@ using Wasm.Model;
 using ModuleSaw;
 using System.Threading.Tasks;
 using System.Threading;
+using System.Net;
 
 namespace WasmStrip {
     class ReferenceComparer<T> : IEqualityComparer<T> {
@@ -51,6 +52,8 @@ namespace WasmStrip {
         public bool DumpFunctions = true, DisassembleFunctions = true;
         public string DumpFunctionsPath;
         public List<Regex> DumpFunctionRegexes = new List<Regex>();
+
+        public string WhatIs;
     }
 
     class NamespaceInfo {
@@ -168,6 +171,29 @@ namespace WasmStrip {
                     if (config.DumpSectionsPath != null)
                         DumpSections(config, wasmBytes, wasmReader);
 
+                    if (!string.IsNullOrEmpty(config.WhatIs)) {
+                        int index = 0;
+                        bool isIndex = false;
+                        if (config.WhatIs.StartsWith("0x"))
+                            isIndex = int.TryParse(config.WhatIs.Substring(2), System.Globalization.NumberStyles.HexNumber, null, out index);
+                        else
+                            isIndex = int.TryParse(config.WhatIs, out index);
+
+                        if (isIndex) {
+                            var biasedIndex = index - wasmReader.FunctionIndexOffset;
+                            if (functions.TryGetValue((uint)biasedIndex, out var fi))
+                                Console.WriteLine($"table entry {index} = #{fi.Index} {fi.Name}");
+                            else
+                                Console.WriteLine($"No table entry for {index}");
+                        } else {
+                            var fi = functions.Values.FirstOrDefault(f => f.Name.Equals(config.WhatIs, StringComparison.OrdinalIgnoreCase));
+                            if (fi != null)
+                                Console.WriteLine($"#{fi.Index} {fi.Name}");
+                            else
+                                Console.WriteLine($"No functions named {config.WhatIs}");
+                        }
+                    }
+
                     ClearLine("Analyzing module.");
 
                     AnalysisData data = null;
@@ -255,6 +281,7 @@ namespace WasmStrip {
                     Console.Error.WriteLine("    --strip-list=regexes.txt");
                     Console.Error.WriteLine("    --retain=regex [...]");
                     Console.Error.WriteLine("    --retain-list=regexes.txt");
+                    Console.Error.WriteLine("  --whatis=(func-index)|0x(hex-func-index)|(func-name)");
                 }
 
                 if (Debugger.IsAttached) {
@@ -992,9 +1019,9 @@ namespace WasmStrip {
                     {"SetLocalRuns", listener.SetLocalRuns },
                     {"DupCandidates", listener.DupCandidates },
                     {"MaxRunSize", listener.MaxRunSize },
-                    {"AverageRunLength", listener.AverageRunLengthSum / (double)listener.RunCount },
+                    {"AverageRunLength", listener.AverageRunLengthSum / (double)Math.Max(listener.RunCount, 1) },
                     {"SimpleI32Memops", listener.SimpleI32Memops },
-                    {"AverageBlockSize", listener.AverageBlockLengthSum / (double)listener.BlockCount },
+                    {"AverageBlockSize", listener.AverageBlockLengthSum / (double)Math.Max(listener.BlockCount, 1) },
                     {"Num2OpBlocks", listener.SmallBlockCounts[2] },
                     {"Num3OpBlocks", listener.SmallBlockCounts[3] },
                     {"Num4OpBlocks", listener.SmallBlockCounts[4] },
@@ -1008,88 +1035,114 @@ namespace WasmStrip {
             EnsureValidPath(path);
 
             using (var output = new StreamWriter(path, false, Encoding.UTF8)) {
-                output.WriteLine("digraph namespaces {");
-
-                const int maxLength = 24;
+                const int maxLength = 64;
                 const int minCount = 2;
+                const double sizeTo1Inch = 10240;
+                const bool namespaceMode = false;
 
-                var namespaceDependencies = data.DependencyGraph.Where(dgn => dgn.NamespaceName != null).ToLookup(dgn => dgn.NamespaceName);
+                if (namespaceMode) {
+                    output.WriteLine("digraph namespaces {");
 
-                var referencedNamespaces = new HashSet<NamespaceInfo>(NamespaceInfo.Comparer);
-                foreach (var kvp in data.Namespaces) {
-                    if ((config.GraphRegexes.Count > 0) && !config.GraphRegexes.Any(gr => gr.IsMatch(kvp.Key)))
-                        continue;
+                    var namespaceDependencies = data.DependencyGraph.Where(dgn => dgn.NamespaceName != null).ToLookup(dgn => dgn.NamespaceName);
 
-                    if (kvp.Value.FunctionCount < minCount)
-                        continue;
-
-                    foreach (var cns in kvp.Value.ChildNamespaces)
-                        referencedNamespaces.Add(cns);
-
-                    if (namespaceDependencies.Contains(kvp.Key)) {
-                        var dgn = namespaceDependencies[kvp.Key].First();
-
-                        foreach (var cn in dgn.ReferencedNamespaces)
-                            referencedNamespaces.Add(data.Namespaces[cn.NamespaceName]);
-                    }
-                }
-
-                var namespaces = new HashSet<NamespaceInfo>(NamespaceInfo.Comparer);
-                foreach (var kvp in data.Namespaces) {
-                    namespaces.Add(kvp.Value);
-
-                    if (namespaceDependencies.Contains(kvp.Key)) {
-                        var dgn = namespaceDependencies[kvp.Key].First();
-
-                        foreach (var rn in dgn.ReferencedNamespaces)
-                            namespaces.Add(data.Namespaces[rn.NamespaceName]);
-                    }
-                }
-
-                var labelsNeeded = new HashSet<NamespaceInfo>(NamespaceInfo.Comparer);
-
-                foreach (var nsi in namespaces) {
-                    if (!referencedNamespaces.Contains(nsi)) {
-                        if (nsi.FunctionCount < minCount)
+                    var referencedNamespaces = new HashSet<NamespaceInfo>(NamespaceInfo.Comparer);
+                    foreach (var kvp in data.Namespaces) {
+                        if ((config.GraphRegexes.Count > 0) && !config.GraphRegexes.Any(gr => gr.IsMatch(kvp.Key)))
                             continue;
 
-                        if ((config.GraphRegexes.Count > 0) && !config.GraphRegexes.Any(gr => gr.IsMatch(nsi.Name)))
-                            continue;
-                    }
-
-                    labelsNeeded.Add(nsi);
-
-                    foreach (var cns in nsi.ChildNamespaces) {
-                        if (cns.FunctionCount < minCount)
+                        if (kvp.Value.FunctionCount < minCount)
                             continue;
 
-                        output.WriteLine($"\t\"ns{nsi.Index.ToString()}\" -> \"ns{cns.Index.ToString()}\";");
+                        foreach (var cns in kvp.Value.ChildNamespaces)
+                            referencedNamespaces.Add(cns);
 
-                        labelsNeeded.Add(nsi);
-                        labelsNeeded.Add(cns);
-                    }
+                        if (namespaceDependencies.Contains(kvp.Key)) {
+                            var dgn = namespaceDependencies[kvp.Key].First();
 
-                    if (namespaceDependencies.Contains(nsi.Name)) {
-                        var dgn = namespaceDependencies[nsi.Name].First();
-
-                        foreach (var rn in dgn.ReferencedNamespaces) {
-                            var rni = data.Namespaces[rn.NamespaceName];
-                            labelsNeeded.Add(rni);
-                            output.WriteLine($"\t\"ns{nsi.Index.ToString()}\" -> \"ns{rni.Index.ToString()}\";");
+                            foreach (var cn in dgn.ReferencedNamespaces)
+                                referencedNamespaces.Add(data.Namespaces[cn.NamespaceName]);
                         }
                     }
+
+                    var namespaces = new HashSet<NamespaceInfo>(NamespaceInfo.Comparer);
+                    foreach (var kvp in data.Namespaces) {
+                        namespaces.Add(kvp.Value);
+
+                        if (namespaceDependencies.Contains(kvp.Key)) {
+                            var dgn = namespaceDependencies[kvp.Key].First();
+
+                            foreach (var rn in dgn.ReferencedNamespaces)
+                                namespaces.Add(data.Namespaces[rn.NamespaceName]);
+                        }
+                    }
+
+                    var labelsNeeded = new HashSet<NamespaceInfo>(NamespaceInfo.Comparer);
+
+                    foreach (var nsi in namespaces) {
+                        if (!referencedNamespaces.Contains(nsi)) {
+                            if (nsi.FunctionCount < minCount)
+                                continue;
+
+                            if ((config.GraphRegexes.Count > 0) && !config.GraphRegexes.Any(gr => gr.IsMatch(nsi.Name)))
+                                continue;
+                        }
+
+                        labelsNeeded.Add(nsi);
+
+                        foreach (var cns in nsi.ChildNamespaces) {
+                            if (cns.FunctionCount < minCount)
+                                continue;
+
+                            output.WriteLine($"\t\"ns{nsi.Index.ToString()}\" -> \"ns{cns.Index.ToString()}\";");
+
+                            labelsNeeded.Add(nsi);
+                            labelsNeeded.Add(cns);
+                        }
+
+                        if (namespaceDependencies.Contains(nsi.Name)) {
+                            var dgn = namespaceDependencies[nsi.Name].First();
+
+                            foreach (var rn in dgn.ReferencedNamespaces) {
+                                var rni = data.Namespaces[rn.NamespaceName];
+                                labelsNeeded.Add(rni);
+                                output.WriteLine($"\t\"ns{nsi.Index.ToString()}\" -> \"ns{rni.Index.ToString()}\";");
+                            }
+                        }
+                    }
+
+                    foreach (var nsi in labelsNeeded) {
+                        var label = nsi.Name.Replace("*", "");
+                        if (label.Length > maxLength)
+                            label = label.Substring(0, maxLength) + "...";
+
+                        var color = config.GraphRegexes.Any(gr => gr.IsMatch(nsi.Name)) ? "AAAAAA" : "DFDFDF";
+                        output.WriteLine($"\t\"ns{nsi.Index.ToString()}\" [label=\"{label}\", style=\"filled\", SizeBytes={nsi.SizeBytes}, FunctionCount={nsi.FunctionCount}];");
+                    }
+
+                    output.WriteLine("}");
+                } else {
+                    output.WriteLine("digraph functions {");
+
+                    foreach (var dgn in data.DependencyGraph) {
+                        if (dgn.Function == null)
+                            continue;
+
+                        if (dgn.DirectDependencies != null)
+                        foreach (var dd in dgn.DirectDependencies) {
+                            if (dd.Function == null)
+                                continue;
+                            output.WriteLine($"\t\"fn{dgn.Function.Index}\" -> \"fn{dd.Function.Index}\";");
+                        }
+
+                        var label = dgn.Function.Name.Replace("*", "");
+                        if (label.Length > maxLength)
+                            label = label.Substring(0, maxLength) + "...";
+
+                        output.WriteLine($"\t\"fn{dgn.Function.Index}\" [label=\"{label}\", style=\"filled\", ShallowSize={dgn.ShallowSize}, DeepSize={dgn.DeepSize}];");
+                    }
+
+                    output.WriteLine("}");
                 }
-
-                foreach (var nsi in labelsNeeded) {
-                    var label = nsi.Name.Replace("*", "");
-                    if (label.Length > maxLength)
-                        label = label.Substring(0, maxLength) + "...";
-
-                    var color = config.GraphRegexes.Any(gr => gr.IsMatch(nsi.Name)) ? "AAAAAA" : "DFDFDF";
-                    output.WriteLine($"\t\"ns{nsi.Index.ToString()}\" [label=\"{label}\", style=\"filled\", color=\"#{color}\"];");
-                }
-
-                output.WriteLine("}");
             }
         }
 
@@ -1851,6 +1904,9 @@ namespace WasmStrip {
                     break;
                 case "dumponly":
                     config.DisassembleFunctions = false;
+                    break;
+                case "whatis":
+                    config.WhatIs = operand;
                     break;
                 default:
                     Console.Error.WriteLine($"Invalid argument: '{arg}'");
