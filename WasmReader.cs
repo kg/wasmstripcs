@@ -12,11 +12,17 @@ namespace WasmStrip {
         public bool Tracing;
 
         public TypeSection Types;
-        public ImportSection Imports;
+        public ImportSection Imports = new ImportSection {
+            entries = Array.Empty<import_entry>(),
+        };
         public FunctionSection Functions;
         public TableSection Tables;
-        public GlobalSection Globals;
-        public ExportSection Exports;
+        public GlobalSection Globals = new GlobalSection {
+            globals = Array.Empty<global_variable>(),
+        };
+        public ExportSection Exports = new ExportSection {
+            entries = Array.Empty<export_entry>(),
+        };
         public ElementSection Elements;
         public CodeSection Code;
 
@@ -72,41 +78,41 @@ namespace WasmStrip {
                 try {
                     switch (sh.id) {
                         case SectionTypes.Type:
-                            Program.Assert(reader.ReadTypeSection(out Types));
+                            reader.ReadTypeSection(out Types);
                             break;
 
                         case SectionTypes.Import:
-                            Program.Assert(reader.ReadImportSection(out Imports));
+                            reader.ReadImportSection(out Imports);
                             break;
 
                         case SectionTypes.Function:
-                            Program.Assert(reader.ReadFunctionSection(out Functions));
+                            reader.ReadFunctionSection(out Functions);
                             break;
 
                         case SectionTypes.Table:
                             // FIXME: Not tested
-                            Program.Assert(reader.ReadTableSection(out Tables));
+                            reader.ReadTableSection(out Tables);
                             break;
 
                         case SectionTypes.Global:
-                            Program.Assert(reader.ReadGlobalSection(out Globals));
+                            reader.ReadGlobalSection(out Globals);
                             break;
 
                         case SectionTypes.Export:
-                            Program.Assert(reader.ReadExportSection(out Exports));
+                            reader.ReadExportSection(out Exports);
                             break;
 
                         case SectionTypes.Element:
-                            Program.Assert(reader.ReadElementSection(out Elements));
+                            reader.ReadElementSection(out Elements);
                             break;
 
                         case SectionTypes.Code:
-                            Program.Assert(reader.ReadCodeSection(out Code, FunctionBodyCallback));
+                            reader.ReadCodeSection(out Code, FunctionBodyCallback);
                             break;
 
                         case SectionTypes.Data:
                             DataSection ds;
-                            Program.Assert(reader.ReadDataSection(out ds));
+                            reader.ReadDataSection(out ds);
                             Input.BaseStream.Seek(sh.StreamPayloadEnd, SeekOrigin.Begin);
                             break;
                     
