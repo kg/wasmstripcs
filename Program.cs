@@ -45,6 +45,7 @@ namespace WasmStrip {
         public string StripReportPath;
 
         public bool VerifyOutput = true;
+        public bool Tracing = false;
 
         public string DumpSectionsPath;
         public List<Regex> DumpSectionRegexes = new List<Regex>();
@@ -154,7 +155,9 @@ namespace WasmStrip {
                 var functions = new Dictionary<uint, FunctionInfo>();
                 WasmReader wasmReader;
                 using (wasmStream) {
-                    wasmReader = new WasmReader(wasmStream);
+                    wasmReader = new WasmReader(wasmStream) {
+                        Tracing = config.Tracing,
+                    };
                     wasmReader.FunctionBodyCallback = (fb, br) => {
                         var info = ProcessFunctionBody(wasmReader, fb, br, config);
                         functions[info.Index] = info;
@@ -324,11 +327,19 @@ namespace WasmStrip {
         }
 
         private static void ClearLine (string newText = null) {
-            Console.CursorLeft = 0;
-            Console.Write(new string(' ', 50));
-            Console.CursorLeft = 0;
-            if (newText != null)
-                Console.Write(newText);
+            // HACK: Tools like dotnet-counters break Console.Cursor
+            try {
+                Console.CursorLeft = 0;
+                Console.Write(new string(' ', 50));
+                Console.CursorLeft = 0;
+                if (newText != null)
+                    Console.Write(newText);
+            } catch {
+                if (newText != null)
+                    Console.WriteLine(newText);
+                else
+                    Console.WriteLine();
+            }
         }
 
         private static void EnsureValidPath (string filename) {
@@ -1907,6 +1918,9 @@ namespace WasmStrip {
                     break;
                 case "whatis":
                     config.WhatIs = operand;
+                    break;
+                case "trace":
+                    config.Tracing = true;
                     break;
                 default:
                     Console.Error.WriteLine($"Invalid argument: '{arg}'");

@@ -9,6 +9,7 @@ using Wasm.Model;
 namespace WasmStrip {
     public class WasmReader {
         public readonly BinaryReader Input;
+        public bool Tracing;
 
         public TypeSection Types;
         public ImportSection Imports;
@@ -54,7 +55,9 @@ namespace WasmStrip {
         }
 
         public void Read () {
-            var reader = new ModuleReader(Input);
+            var reader = new ModuleReader(Input) {
+                Tracing = Tracing
+            };
 
             Program.Assert(reader.ReadHeader(), "ReadHeader");
 
@@ -66,55 +69,59 @@ namespace WasmStrip {
 
                 SectionHeaders.Add(sh);
 
-                switch (sh.id) {
-                    case SectionTypes.Type:
-                        Program.Assert(reader.ReadTypeSection(out Types));
-                        break;
+                try {
+                    switch (sh.id) {
+                        case SectionTypes.Type:
+                            Program.Assert(reader.ReadTypeSection(out Types));
+                            break;
 
-                    case SectionTypes.Import:
-                        Program.Assert(reader.ReadImportSection(out Imports));
-                        break;
+                        case SectionTypes.Import:
+                            Program.Assert(reader.ReadImportSection(out Imports));
+                            break;
 
-                    case SectionTypes.Function:
-                        Program.Assert(reader.ReadFunctionSection(out Functions));
-                        break;
+                        case SectionTypes.Function:
+                            Program.Assert(reader.ReadFunctionSection(out Functions));
+                            break;
 
-                    case SectionTypes.Table:
-                        // FIXME: Not tested
-                        Program.Assert(reader.ReadTableSection(out Tables));
-                        break;
+                        case SectionTypes.Table:
+                            // FIXME: Not tested
+                            Program.Assert(reader.ReadTableSection(out Tables));
+                            break;
 
-                    case SectionTypes.Global:
-                        Program.Assert(reader.ReadGlobalSection(out Globals));
-                        break;
+                        case SectionTypes.Global:
+                            Program.Assert(reader.ReadGlobalSection(out Globals));
+                            break;
 
-                    case SectionTypes.Export:
-                        Program.Assert(reader.ReadExportSection(out Exports));
-                        break;
+                        case SectionTypes.Export:
+                            Program.Assert(reader.ReadExportSection(out Exports));
+                            break;
 
-                    case SectionTypes.Element:
-                        Program.Assert(reader.ReadElementSection(out Elements));
-                        break;
+                        case SectionTypes.Element:
+                            Program.Assert(reader.ReadElementSection(out Elements));
+                            break;
 
-                    case SectionTypes.Code:
-                        Program.Assert(reader.ReadCodeSection(out Code, FunctionBodyCallback));
-                        break;
+                        case SectionTypes.Code:
+                            Program.Assert(reader.ReadCodeSection(out Code, FunctionBodyCallback));
+                            break;
 
-                    case SectionTypes.Data:
-                        DataSection ds;
-                        Program.Assert(reader.ReadDataSection(out ds));
-                        Input.BaseStream.Seek(sh.StreamPayloadEnd, SeekOrigin.Begin);
-                        break;
+                        case SectionTypes.Data:
+                            DataSection ds;
+                            Program.Assert(reader.ReadDataSection(out ds));
+                            Input.BaseStream.Seek(sh.StreamPayloadEnd, SeekOrigin.Begin);
+                            break;
                     
-                    case SectionTypes.Custom:
-                        if (sh.name == "name")
-                            ReadNameSection(reader, Input, sh);
-                        Input.BaseStream.Seek(sh.StreamPayloadEnd, SeekOrigin.Begin);
-                        break;
+                        case SectionTypes.Custom:
+                            if (sh.name == "name")
+                                ReadNameSection(reader, Input, sh);
+                            Input.BaseStream.Seek(sh.StreamPayloadEnd, SeekOrigin.Begin);
+                            break;
 
-                    default:
-                        Input.BaseStream.Seek(sh.StreamPayloadEnd, SeekOrigin.Begin);
-                        break;
+                        default:
+                            Input.BaseStream.Seek(sh.StreamPayloadEnd, SeekOrigin.Begin);
+                            break;
+                    }
+                } catch (Exception exc) {
+                    throw new Exception($"Error reading {sh.id} section", exc);
                 }
             }
         }
