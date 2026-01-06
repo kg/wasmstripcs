@@ -316,7 +316,14 @@ namespace WasmStrip {
                     continue;
 
                 var biasedIndex = kvp.Key - offset;
-                functions[(uint)biasedIndex].Name = kvp.Value;
+                functions[biasedIndex].Name = kvp.Value;
+            }
+
+            foreach (var export in wasmReader.Exports.entries) {
+                if (export.kind != external_kind.Function)
+                    continue;
+                var biasedIndex = export.index - offset;
+                functions[biasedIndex].Name ??= export.field;
             }
         }
 
@@ -1764,7 +1771,7 @@ namespace WasmStrip {
 
             var result = new FunctionInfo {
                 Index = fb.Index,
-                TypeIndex = (typeIndex = wr.Functions.types[fb.Index]),
+                TypeIndex = (typeIndex = wr.Functions.types[fb.Index].index),
                 Type = wr.Types.entries[typeIndex],
                 Body = fb
             };
