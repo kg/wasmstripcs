@@ -1412,10 +1412,12 @@ namespace WasmStrip {
                 if (elem.index != 0)
                     continue;
 
-                if (elem.offset.Opcode != Opcodes.i32_const)
-                    throw new NotImplementedException($"Unexpected elements offset {elem.offset.Opcode}");
+                // FIXME: Implement extended constant expressions
+                var offset = elem.offset.FirstOrDefault();
+                if (offset.Opcode != Opcodes.i32_const)
+                    throw new NotImplementedException($"Unexpected elements offset {offset.Opcode}");
 
-                var startOffset = elem.offset.Body.U.i32;
+                var startOffset = offset.Body.U.i32;
                 var endOffset = startOffset + elem.elems.Length;
                 if (endOffset >= table.Length)
                     Array.Resize(ref table, endOffset);
