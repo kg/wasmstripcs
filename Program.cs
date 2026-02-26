@@ -615,17 +615,21 @@ namespace WasmStrip {
         }
 
         private class DisassembleListener : ExpressionReaderListener {
-            const int BytesWidth = 16;
+            private record struct BlockInfo (int id, long startOffset, bool isLoop);
+
+            const int BytesWidth = 20;
 
             int Depth;
 
             public Opcodes LastSeenOpcode;
+            int NextBlockId;
             readonly uint FunctionIndexOffset;
             readonly FunctionInfo Function;
             readonly func_type[] Types;
             readonly Dictionary<uint, string> FunctionNames;
             readonly Dictionary<uint, FunctionInfo> Functions;
-            readonly Stack<long> StartOffsets = new Stack<long>();
+            readonly Stack<BlockInfo> Blocks = new ();
+            readonly Stack<long> StartOffsets = new ();
             readonly Stream Input;
             readonly ArraySegment<byte> InputBytes;
             readonly TextWriter Output;
@@ -666,9 +670,11 @@ namespace WasmStrip {
 
             public void BeginBody (ref Expression expression, bool readingChildNodes) {
                 if (readingChildNodes) {
+                    var info = new BlockInfo(NextBlockId++, StartOffsets.Peek(), expression.Opcode == Opcodes.loop);
+                    Blocks.Push(info);
                     Output.WriteLine();
                     WriteHeader(ref expression);
-                    Output.WriteLine("(");
+                    Output.WriteLine($"( ; block #{info.id}");
                 }
             }
 
@@ -692,7 +698,7 @@ namespace WasmStrip {
                 var position = Input.Position;
                 var count = (int)(endOffset - startOffset);
 
-                sb.AppendFormat("{0:0000} ", startOffset + InputBytes.Offset);
+                sb.AppendFormat("@{0:0000}  ", startOffset + InputBytes.Offset);
 
                 int lineOffset = 0;
                 for (int i = 0; i < count; i++) {
@@ -764,13 +770,15 @@ namespace WasmStrip {
                     Output.Write("<error>");
                     Depth -= 1;
                 } else if (readChildNodes) {
+                    var blockInfo = Blocks.Pop();
                     Depth -= 1;
-                    WriteIndented(16, ")");
+                    WriteIndented(16, $") ; #{blockInfo.id} {blockInfo.startOffset + InputBytes.Offset}-{Input.Position + InputBytes.Offset}");
                     Output.WriteLine();
                     Output.WriteLine();
                 } else {
                     switch (expression.Opcode) {
                         case Opcodes.call:
+                            Output.Write($"#{expression.Body.U.u32} ; ");
                             if (expression.Body.U.u32 >= FunctionIndexOffset) {
                                 var funcIndex = expression.Body.U.u32 - FunctionIndexOffset;
                                 if (!Functions.TryGetValue(funcIndex, out FunctionInfo func)) {
@@ -788,13 +796,19 @@ namespace WasmStrip {
 
                         case Opcodes.call_indirect:
                             var imm = expression.Body.U.call_indirect;
-                            Output.WriteLine($"tables[{imm.table_index}] {GetSignatureForType(Types[imm.sig_index])}");
+                            Output.WriteLine($"tables[{imm.table_index}] ; {GetSignatureForType(Types[imm.sig_index])}");
+                            break;
+
+                        case Opcodes.br:
+                        case Opcodes.br_if:
+                            var targetBlockInfo = Blocks.ElementAt((int)expression.Body.U.u32);
+                            Output.WriteLine($"{expression.Body.U.u32} ; {(targetBlockInfo.isLoop ? "loop" : "block")} #{targetBlockInfo.id} started at {targetBlockInfo.startOffset + InputBytes.Offset}");
                             break;
 
                         case Opcodes.get_local:
                         case Opcodes.set_local:
                         case Opcodes.tee_local:
-                            Output.WriteLine($"{GetTypeOfLocal(expression.Body.U.u32)} {GetNameOfLocal(expression.Body.U.u32)}");
+                            Output.WriteLine($"{expression.Body.U.u32} ; {GetTypeOfLocal(expression.Body.U.u32)} {GetNameOfLocal(expression.Body.U.u32)}");
                             break;
 
                         default:
@@ -804,24 +818,24 @@ namespace WasmStrip {
                                     break;
                                 case ExpressionBody.Types.u32:
                                     if (expression.Body.U.u32 >= 10)
-                                        Output.WriteLine($"0x{expression.Body.U.u32:X8} {expression.Body.U.u32}");
+                                        Output.WriteLine($"0x{expression.Body.U.u32:X8} ; {expression.Body.U.u32}");
                                     else
                                         Output.WriteLine(expression.Body.U.u32);
                                     break;
                                 case ExpressionBody.Types.i64:
-                                    Output.WriteLine($"0x{expression.Body.U.u64:X16} {expression.Body.U.i64}");
+                                    Output.WriteLine($"0x{expression.Body.U.u64:X16} ; {expression.Body.U.i64}");
                                     break;
                                 case ExpressionBody.Types.i32:
                                     if (expression.Body.U.u32 >= 10)
-                                        Output.WriteLine($"0x{expression.Body.U.u32:X8} {expression.Body.U.i32}");
+                                        Output.WriteLine($"0x{expression.Body.U.u32:X8} ; {expression.Body.U.i32}");
                                     else
                                         Output.WriteLine(expression.Body.U.i32);
                                     break;
                                 case ExpressionBody.Types.f64:
-                                    Output.WriteLine($"0x{expression.Body.U.u64:X16} {expression.Body.U.f64}");
+                                    Output.WriteLine($"0x{expression.Body.U.u64:X16} ; {expression.Body.U.f64}");
                                     break;
                                 case ExpressionBody.Types.f32:
-                                    Output.WriteLine($"0x{expression.Body.U.u32:X8} {expression.Body.U.f32}");
+                                    Output.WriteLine($"0x{expression.Body.U.u32:X8} ; {expression.Body.U.f32}");
                                     break;
                                 case ExpressionBody.Types.memory:
                                     if (expression.Body.U.memory.alignment_exponent != 0)
