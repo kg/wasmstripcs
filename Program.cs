@@ -772,7 +772,7 @@ namespace WasmStrip {
                 } else if (readChildNodes) {
                     var blockInfo = Blocks.Pop();
                     Depth -= 1;
-                    WriteIndented(16, $") ; #{blockInfo.id} {blockInfo.startOffset + InputBytes.Offset}-{Input.Position + InputBytes.Offset}");
+                    WriteIndented(BytesWidth, $") ; #{blockInfo.id} {blockInfo.startOffset + InputBytes.Offset}-{Input.Position + InputBytes.Offset}");
                     Output.WriteLine();
                     Output.WriteLine();
                 } else {
