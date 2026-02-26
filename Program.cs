@@ -270,12 +270,13 @@ namespace WasmStrip {
             } finally {
                 if (!execStarted) {
                     Console.Error.WriteLine("Usage: WasmStrip module.wasm [--option ...] [@response.rsp]");
+                    Console.Error.WriteLine("  --trace");
                     Console.Error.WriteLine("  --report-out=filename.xml");
                     Console.Error.WriteLine("  --graph-out=filename.dot");
                     Console.Error.WriteLine("    --graph-filter=regex [...]");
                     Console.Error.WriteLine("  --diff-against=oldmodule.wasm --diff-out=filename.csv");
                     Console.Error.WriteLine("  --dump-sections[=regex] --dump-sections-to=outdir/");
-                    Console.Error.WriteLine("  --dump-functions=regex --dump-functions-to=outdir/");
+                    Console.Error.WriteLine("  --dump-functions=regex --dump-functions-to=(outdir/|stdout)");
                     Console.Error.WriteLine("    --disassemble-only");
                     Console.Error.WriteLine("    --dump-only");
                     Console.Error.WriteLine("  --strip-out=newmodule.wasm");
