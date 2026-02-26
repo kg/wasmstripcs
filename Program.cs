@@ -545,14 +545,20 @@ namespace WasmStrip {
         }
 
         private static void DumpFunctions (Config config, byte[] wasmBytes, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
-            Directory.CreateDirectory(config.DumpFunctionsPath);
+            var toStdout = config.DumpFunctionsPath.Equals("stdout", StringComparison.OrdinalIgnoreCase);
+            if (!toStdout)
+                Directory.CreateDirectory(config.DumpFunctionsPath);
 
             int count = 0;
 
-            Parallel.ForEach(wasmReader.Code.bodies, (body) => {
+            var options = new ParallelOptions {
+                MaxDegreeOfParallelism = toStdout ? 1 : 16,
+            };
+            Parallel.ForEach(wasmReader.Code.bodies, options, (body) => {
                 var i = Interlocked.Increment(ref count);
                 if (((i % 5000) == 0) && (i > 0)) {
-                    ClearLine($"Dumping functions... {i}/{functions.Count}");
+                    if (!toStdout)
+                        ClearLine($"Dumping functions... {i}/{functions.Count}");
                 }
 
                 var fi = functions[body.Index];
@@ -573,7 +579,7 @@ namespace WasmStrip {
                 var inBytes = new ArraySegment<byte>(wasmBytes, (int)body.StreamOffset, (int)(body.StreamEnd - body.StreamOffset));
                 using (var fb = GetFunctionBodyStream(wasmBytes, body)) {
                     try {
-                        if (config.DumpFunctions)
+                        if (config.DumpFunctions && !toStdout)
                             using (var outStream = File.OpenWrite(path)) {
                                 outStream.SetLength(0);
 
@@ -587,15 +593,19 @@ namespace WasmStrip {
                     path = Path.Combine(config.DumpFunctionsPath, fileName + ".dis");
 
                     try {
-                        if (config.DisassembleFunctions)
-                        using (var outStream = File.OpenWrite(path)) {
-                            outStream.SetLength(0);
+                        if (config.DisassembleFunctions) {
+                            TextWriter writer = toStdout
+                                ? Console.Out
+                                : new StreamWriter(path, false, Encoding.UTF8);
 
                             fb.Position = 0;
                             DisassembleFunctionBody(
-                                name, fb, fi, inBytes, outStream, wasmReader.FunctionNames, functions, 
+                                name, fb, fi, inBytes, writer, wasmReader.FunctionNames, functions, 
                                 wasmReader.ImportedFunctionCount, wasmReader.Types.entries
                             );
+
+                            if (!toStdout)
+                                writer.Dispose();
                         }
                     } catch (Exception exc) {
                         Console.Error.WriteLine($"Failed to dump function {name}: {exc.Message}");
@@ -618,10 +628,10 @@ namespace WasmStrip {
             readonly Stack<long> StartOffsets = new Stack<long>();
             readonly Stream Input;
             readonly ArraySegment<byte> InputBytes;
-            readonly StreamWriter Output;
+            readonly TextWriter Output;
 
             public DisassembleListener (
-                Stream input, ArraySegment<byte> inputBytes, StreamWriter output, FunctionInfo function,
+                Stream input, ArraySegment<byte> inputBytes, TextWriter output, FunctionInfo function,
                 Dictionary<uint, string> functionNames, Dictionary<uint, FunctionInfo> functions, 
                 uint functionIndexOffset, func_type[] types
             ) {
@@ -675,7 +685,7 @@ namespace WasmStrip {
             char[] RangeBuffer = new char[10240];
             StringBuilder RangeBuilder = new StringBuilder();
 
-            private void RangeToBytes (long startOffset, long endOffset, StreamWriter output) {
+            private void RangeToBytes (long startOffset, long endOffset, TextWriter output) {
                 var sb = RangeBuilder;
                 sb.Clear();
 
@@ -799,7 +809,7 @@ namespace WasmStrip {
                                         Output.WriteLine(expression.Body.U.u32);
                                     break;
                                 case ExpressionBody.Types.i64:
-                                    Output.WriteLine($"0x{expression.Body.U.i64:X16} {expression.Body.U.i64}");
+                                    Output.WriteLine($"0x{expression.Body.U.u64:X16} {expression.Body.U.i64}");
                                     break;
                                 case ExpressionBody.Types.i32:
                                     if (expression.Body.U.u32 >= 10)
@@ -808,7 +818,7 @@ namespace WasmStrip {
                                         Output.WriteLine(expression.Body.U.i32);
                                     break;
                                 case ExpressionBody.Types.f64:
-                                    Output.WriteLine($"0x{expression.Body.U.u32:X16} {expression.Body.U.f64}");
+                                    Output.WriteLine($"0x{expression.Body.U.u64:X16} {expression.Body.U.f64}");
                                     break;
                                 case ExpressionBody.Types.f32:
                                     Output.WriteLine($"0x{expression.Body.U.u32:X8} {expression.Body.U.f32}");
@@ -850,13 +860,12 @@ namespace WasmStrip {
         }
 
         private static void DisassembleFunctionBody (
-            string name, Stream stream, FunctionInfo function, ArraySegment<byte> inputBytes, FileStream outStream, 
+            string name, Stream stream, FunctionInfo function, ArraySegment<byte> inputBytes, TextWriter outWriter, 
             Dictionary<uint, string> functionNames, Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset, func_type[] types
         ) {
             var body = function.Body;
 
-            var outWriter = new StreamWriter(outStream, Encoding.UTF8);
-            outWriter.WriteLine($"{name} ( {string.Join(", ", function.Type.param_types)} ) -> {function.Type.return_type} ({function.Body.body_size} byte(s))");
+            outWriter.WriteLine($"#{function.Index} {name} ( {string.Join(", ", function.Type.param_types)} ) -> {function.Type.return_type} ({function.Body.body_size} byte(s))");
             if (body.locals.Length > 0) {
                 outWriter.WriteLine($"{body.locals.Sum(l => l.count)} local(s)");
                 foreach (var l in body.locals)
