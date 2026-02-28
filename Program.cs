@@ -555,6 +555,27 @@ namespace WasmStrip {
             var options = new ParallelOptions {
                 MaxDegreeOfParallelism = toStdout ? 1 : 16,
             };
+
+            var globals = new Dictionary<uint, (string name, LanguageTypes type)>();
+            uint globalIndex = 0;
+            foreach (var import in wasmReader.Imports.entries) {
+                if (import.kind != external_kind.Global)
+                    continue;
+
+                globals[globalIndex] = ($"{import.module}.{import.field}", import.type.Global.content_type);
+                globalIndex++;
+            }
+            foreach (var global in wasmReader.Globals.globals) {
+                globals[globalIndex] = ($"#{globalIndex}", global.type.content_type);
+                globalIndex++;
+            }
+            foreach (var export in wasmReader.Exports.entries) {
+                if (export.kind != external_kind.Global)
+                    continue;
+
+                globals[export.index] = (export.field, globals[export.index].type);
+            }
+
             Parallel.ForEach(wasmReader.Code.bodies, options, (body) => {
                 var i = Interlocked.Increment(ref count);
                 if (((i % 5000) == 0) && (i > 0)) {
@@ -602,7 +623,7 @@ namespace WasmStrip {
                             fb.Position = 0;
                             DisassembleFunctionBody(
                                 name, fb, fi, inBytes, writer, wasmReader.FunctionNames, functions, 
-                                wasmReader.ImportedFunctionCount, wasmReader.Types.entries
+                                wasmReader.ImportedFunctionCount, wasmReader.Types.entries, globals
                             );
 
                             if (!toStdout)
@@ -629,6 +650,7 @@ namespace WasmStrip {
             readonly func_type[] Types;
             readonly Dictionary<uint, string> FunctionNames;
             readonly Dictionary<uint, FunctionInfo> Functions;
+            readonly Dictionary<uint, (string name, LanguageTypes type)> Globals;
             readonly Stack<BlockInfo> Blocks = new ();
             readonly Stack<long> StartOffsets = new ();
             readonly Stream Input;
@@ -638,12 +660,13 @@ namespace WasmStrip {
             public DisassembleListener (
                 Stream input, ArraySegment<byte> inputBytes, TextWriter output, FunctionInfo function,
                 Dictionary<uint, string> functionNames, Dictionary<uint, FunctionInfo> functions, 
-                uint functionIndexOffset, func_type[] types
+                uint functionIndexOffset, func_type[] types, Dictionary<uint, (string name, LanguageTypes type)> globals
             ) {
                 FunctionIndexOffset = functionIndexOffset;
                 Function = function;
                 FunctionNames = functionNames;
                 Functions = functions;
+                Globals = globals;
                 Types = types;
                 Input = input;
                 InputBytes = inputBytes;
@@ -738,6 +761,16 @@ namespace WasmStrip {
                 Depth += 1;
             }
 
+            private Wasm.Model.LanguageTypes GetTypeOfGlobal (uint index) {
+                Globals.TryGetValue(index, out var result);
+                return result.type;
+            }
+
+            private string GetNameOfGlobal (uint index) {
+                Globals.TryGetValue(index, out var result);
+                return result.name;
+            }
+
             private Wasm.Model.LanguageTypes GetTypeOfLocal (uint index) {
                 if (index < Function.Type.param_types.Length)
                     return Function.Type.param_types[index];
@@ -804,6 +837,11 @@ namespace WasmStrip {
                         case Opcodes.br_if:
                             var targetBlockInfo = Blocks.ElementAt((int)expression.Body.U.u32);
                             Output.WriteLine($"{expression.Body.U.u32} ; {(targetBlockInfo.isLoop ? "loop" : "block")} #{targetBlockInfo.id} started at {targetBlockInfo.startOffset + InputBytes.Offset}");
+                            break;
+
+                        case Opcodes.get_global:
+                        case Opcodes.set_global:
+                            Output.WriteLine($"{expression.Body.U.u32} ; {GetTypeOfGlobal(expression.Body.U.u32)} {GetNameOfGlobal(expression.Body.U.u32)}");
                             break;
 
                         case Opcodes.get_local:
@@ -876,7 +914,8 @@ namespace WasmStrip {
 
         private static void DisassembleFunctionBody (
             string name, Stream stream, FunctionInfo function, ArraySegment<byte> inputBytes, TextWriter outWriter, 
-            Dictionary<uint, string> functionNames, Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset, func_type[] types
+            Dictionary<uint, string> functionNames, Dictionary<uint, FunctionInfo> functions, uint functionIndexOffset, 
+            func_type[] types, Dictionary<uint, (string name, LanguageTypes type)> globals
         ) {
             var body = function.Body;
 
@@ -893,7 +932,7 @@ namespace WasmStrip {
                 var fbr = new BinaryReader(stream, Encoding.UTF8, true);
                 var er = new ExpressionReader(fbr);
 
-                var listener = new DisassembleListener(stream, inputBytes, outWriter, function, functionNames, functions, functionIndexOffset, types);
+                var listener = new DisassembleListener(stream, inputBytes, outWriter, function, functionNames, functions, functionIndexOffset, types, globals);
 
                 while (true) {
                     Expression expr;
