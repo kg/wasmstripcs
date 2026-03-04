@@ -639,7 +639,7 @@ namespace WasmStrip {
         private class DisassembleListener : ExpressionReaderListener {
             private record struct BlockInfo (int id, long startOffset, bool isLoop);
 
-            const int BytesWidth = 20;
+            const int BytesWidth = 22;
 
             int Depth;
 
@@ -1805,6 +1805,7 @@ namespace WasmStrip {
         private static void Append (StringBuilder sb, LanguageTypes type) {
             switch (type) {
                 case LanguageTypes.none:
+                    sb.Append("v");
                     return;
                 case LanguageTypes.i32:
                     sb.Append("i");
@@ -1817,6 +1818,9 @@ namespace WasmStrip {
                     return;
                 case LanguageTypes.f64:
                     sb.Append("d");
+                    return;
+                case LanguageTypes.v128:
+                    sb.Append("V");
                     return;
                 case LanguageTypes.anyfunc:
                 case LanguageTypes.func:
