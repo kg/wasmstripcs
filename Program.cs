@@ -676,7 +676,7 @@ namespace WasmStrip {
         private class DisassembleListener : ExpressionReaderListener {
             private record struct BlockInfo (int id, long startOffset, bool isLoop);
 
-            const int BytesWidth = 22;
+            const int BytesWidth = 24;
 
             int Depth;
 
