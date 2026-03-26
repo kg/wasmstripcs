@@ -55,6 +55,7 @@ namespace WasmStrip {
         public List<Regex> DumpFunctionRegexes = new List<Regex>();
 
         public string WhatIs;
+        public long Find;
     }
 
     class NamespaceInfo {
@@ -169,10 +170,10 @@ namespace WasmStrip {
                     AssignFunctionNames(functions, wasmReader);
                     AssignImportNames(wasmReader);
 
-                    ClearLine("Dumping sections...");
-
-                    if (config.DumpSectionsPath != null)
+                    if (config.DumpSectionsPath != null) {
+                        ClearLine("Dumping sections... ");
                         DumpSections(config, wasmBytes, wasmReader);
+                    }
 
                     if (!string.IsNullOrEmpty(config.WhatIs)) {
                         int index = 0;
@@ -204,6 +205,11 @@ namespace WasmStrip {
                         var functionArray = new FunctionInfo[functions.Count];
                         functions.Values.CopyTo(functionArray, 0);
                         data = new AnalysisData(config, wasmBytes, wasmStream, wasmReader, functionArray);
+                    }
+
+                    if (config.Find > 0) {
+                        ClearLine("Finding offset... ");
+                        FindOffset(config.Find, wasmReader, functions);
                     }
 
                     ClearLine("Generating reports...");
@@ -286,6 +292,8 @@ namespace WasmStrip {
                     Console.Error.WriteLine("    --retain=regex [...]");
                     Console.Error.WriteLine("    --retain-list=regexes.txt");
                     Console.Error.WriteLine("  --whatis=(func-index)|0x(hex-func-index)|(func-name)");
+                    Console.Error.WriteLine("  --find=(offset)|0x(hex-offset)");
+
                 }
 
                 if (Debugger.IsAttached) {
@@ -295,6 +303,35 @@ namespace WasmStrip {
             }
 
             return 0;
+        }
+
+        private static void FindOffset (long find, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
+            for (int i = 0; i < wasmReader.SectionHeaders.Count; i++) {
+                var sh = wasmReader.SectionHeaders[i];
+                if (find < sh.StreamPayloadStart)
+                    continue;
+                else if (find > sh.StreamPayloadEnd)
+                    continue;
+
+                Console.Error.WriteLine($"Offset {find} (0x{find:X8}) is in section #{i}: {sh.id}");
+                if (sh.id == SectionTypes.Code)
+                    FindOffsetInFunction(find, wasmReader, functions);
+            }
+        }
+
+        private static void FindOffsetInFunction (long find, WasmReader wasmReader, Dictionary<uint, FunctionInfo> functions) {
+            for (int i = 0; i < wasmReader.Code.bodies.Length; i++) {
+                var body = wasmReader.Code.bodies[i];
+                if (find < body.StreamOffset)
+                    continue;
+                else if (find > body.StreamEnd)
+                    continue;
+
+                string name = "???";
+                if (functions.TryGetValue((uint)i, out var fi))
+                    name = fi.Name ?? "???";
+                Console.Error.WriteLine($"Offset {find} (0x{find:X8}) is in function #{i}: {name}");
+            }
         }
 
         private static void AssignImportNames (WasmReader wasmReader) {
@@ -1994,6 +2031,12 @@ namespace WasmStrip {
                     break;
                 case "whatis":
                     config.WhatIs = operand;
+                    break;
+                case "find":
+                    if (operand.StartsWith("0x"))
+                        config.Find = long.Parse(operand.Substring(2), System.Globalization.NumberStyles.HexNumber);
+                    else
+                        config.Find = long.Parse(operand);
                     break;
                 case "trace":
                     config.Tracing = true;
