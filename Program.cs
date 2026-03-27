@@ -792,8 +792,9 @@ namespace WasmStrip {
                 
                 WriteIndented(0, expression.Opcode.ToString() + " ");
 
-                if ((expression.Body.Type & ExpressionBody.Types.type) == ExpressionBody.Types.type)
+                if ((expression.Body.Type & ~ExpressionBody.Types.children) == ExpressionBody.Types.type) {
                     Output.Write($"{expression.Body.U.type} ");
+                }
 
                 Depth += 1;
             }
